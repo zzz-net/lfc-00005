@@ -265,11 +265,13 @@ python -m contract_archiver export -b <批次ID> -o report.csv -f csv
 
 - `batches`：扫描批次元信息
 - `issues`：问题明细及状态/处理人/备注/稳定指纹
-- `undo_log`：撤销日志（逐条回滚用，执行撤销后删除）
-- `audit_log`：**永久审计日志**（所有状态变更和撤销操作，永不删除）
-- `filter_schemes`：筛选方案（名称 + 批次/状态/严重度/项目类型条件，重启后保留）
+- `undo_log`：**问题级**撤销日志（逐条回滚用，执行撤销后删除）
+- `audit_log`：**问题级**永久审计日志（所有状态变更和撤销操作，永不删除）
+- `filter_schemes`：筛选方案（名称 + 批次/状态/严重度/项目类型 + created_at/updated_at/**version** 版本号，重启后保留）
+- `scheme_undo_log`：**方案级**撤销日志（覆盖导入/`scheme save --overwrite` 后可回退，按方案名唯一）
+- `scheme_audit_log`：**方案级**永久审计日志（save/import/skip/overwrite/delete/undo_scheme 都有记录，含 `source_file` 迁移包来源文件路径）
 
-数据库支持自动迁移：旧版本数据库会自动添加 `fingerprint` 列和 `audit_log` 表，无需手动升级。
+数据库支持自动迁移：旧版本数据库会自动添加 `fingerprint` 列、`audit_log` 表、`filter_schemes.version` 列、方案级 `scheme_undo_log` / `scheme_audit_log` 表，无需手动升级。
 
 删除数据库文件即清空所有历史，数据库文件可直接归档保留。
 

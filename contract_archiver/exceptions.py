@@ -92,3 +92,25 @@ class SchemeImportConflictError(MigrationPackageError):
         super().__init__(
             f"[导入冲突] 方案 '{name}' 已存在，使用 --overwrite 可覆盖"
         )
+
+
+class BatchNotFoundError(ContractArchiverError):
+    def __init__(self, batch_id: str):
+        super().__init__(f"[批次不存在] 未找到批次: {batch_id}")
+
+
+class NoPreviousBatchError(ContractArchiverError):
+    def __init__(self, batch_id: str, scan_path: str):
+        super().__init__(
+            f"[无上一批次] 批次 {batch_id} 所在路径 {scan_path} 没有更早的扫描批次，无法对比"
+        )
+
+
+class BatchPathMismatchWarning(ContractArchiverError):
+    def __init__(self, batch1_id: str, path1: str, batch2_id: str, path2: str):
+        super().__init__(
+            f"[路径不同] 两个批次扫描路径不一致：\n"
+            f"  {batch1_id}: {path1}\n"
+            f"  {batch2_id}: {path2}\n"
+            f"路径不同的批次对比可能无意义，如确认后可使用 --ignore-path 强制执行"
+        )

@@ -61,6 +61,7 @@ class IssueRecord:
     handler: str | None = None
     note: str | None = None
     updated_at: str | None = None
+    inherited_from_batch_id: str | None = None
 
     @property
     def state_label(self) -> str:
@@ -74,6 +75,53 @@ class IssueRecord:
     @property
     def severity_label(self) -> str:
         return "错误" if self.severity == IssueSeverity.ERROR else "警告"
+
+
+DIFF_TYPE_LABELS = {
+    "added": "新增",
+    "removed": "消失",
+    "inherited": "继承",
+}
+
+
+@dataclass
+class DiffIssueRecord:
+    diff_type: str
+    issue: IssueRecord
+    old_issue: IssueRecord | None = None
+
+    @property
+    def diff_type_label(self) -> str:
+        return DIFF_TYPE_LABELS.get(self.diff_type, self.diff_type)
+
+
+@dataclass
+class BatchDiffResult:
+    batch_old: BatchInfo
+    batch_new: BatchInfo
+    added: list[IssueRecord]
+    removed: list[IssueRecord]
+    inherited: list[DiffIssueRecord]
+
+    @property
+    def added_count(self) -> int:
+        return len(self.added)
+
+    @property
+    def removed_count(self) -> int:
+        return len(self.removed)
+
+    @property
+    def inherited_count(self) -> int:
+        return len(self.inherited)
+
+    @property
+    def total_old(self) -> int:
+        return self.removed_count + self.inherited_count
+
+    @property
+    def total_new(self) -> int:
+        return self.added_count + self.inherited_count
 
 
 @dataclass
@@ -309,6 +357,12 @@ class Storage:
             except sqlite3.OperationalError:
                 conn.execute("ALTER TABLE filter_schemes ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
 
+            try:
+                conn.execute("SELECT inherited_from_batch_id FROM issues LIMIT 1")
+            except sqlite3.OperationalError:
+                conn.execute("ALTER TABLE issues ADD COLUMN inherited_from_batch_id TEXT")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_issues_inherited_from ON issues(inherited_from_batch_id)")
+
     def find_latest_batch(self, scan_path: str) -> Optional[BatchInfo]:
         resolved = str(Path(scan_path).resolve())
         with self._conn() as conn:
@@ -347,7 +401,7 @@ class Storage:
         resolved = str(Path(scan_path).resolve())
         with self._tx() as conn:
             existing = conn.execute(
-                "SELECT batch_id FROM batches WHERE scan_path = ? ORDER BY scanned_at DESC LIMIT 1",
+                "SELECT batch_id FROM batches WHERE scan_path = ? ORDER BY scanned_at DESC, batch_id DESC LIMIT 1",
                 (resolved,),
             ).fetchone()
             if existing and not force:
@@ -371,7 +425,7 @@ class Storage:
                         }
 
             batch_id = datetime.now().strftime("%Y%m%d%H%M%S") + "_" + uuid.uuid4().hex[:8]
-            scanned_at = scan_result.timestamp.isoformat(timespec="seconds")
+            scanned_at = scan_result.timestamp.isoformat(timespec="microseconds")
             config_resolved = str(Path(config_path).resolve()) if config_path else None
 
             conn.execute(
@@ -402,8 +456,9 @@ class Storage:
                         """INSERT INTO issues
                         (batch_id, project_path, project_name, project_type_id,
                          issue_type, severity, rule_name, file_path, message,
-                         fingerprint, state, handler, note, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                         fingerprint, state, handler, note, updated_at,
+                         inherited_from_batch_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             batch_id,
                             proj.project_path,
@@ -419,6 +474,7 @@ class Storage:
                             handler,
                             note,
                             updated_at,
+                            inherited_from,
                         ),
                     )
                     issue_count += 1
@@ -439,7 +495,7 @@ class Storage:
         if scan_path:
             sql += " WHERE b.scan_path = ?"
             params.append(str(Path(scan_path).resolve()))
-        sql += " GROUP BY b.batch_id ORDER BY b.scanned_at DESC"
+        sql += " GROUP BY b.batch_id ORDER BY b.scanned_at DESC, b.batch_id DESC"
 
         with self._conn() as conn:
             rows = conn.execute(sql, params).fetchall()
@@ -456,6 +512,93 @@ class Storage:
                 )
                 for r in rows
             ]
+
+    def get_batch(self, batch_id: str) -> BatchInfo | None:
+        sql = """SELECT b.*,
+                 SUM(CASE WHEN i.state='pending' THEN 1 ELSE 0 END) as pending_count,
+                 SUM(CASE WHEN i.state='passed' THEN 1 ELSE 0 END) as passed_count,
+                 SUM(CASE WHEN i.state='ignored' THEN 1 ELSE 0 END) as ignored_count,
+                 COUNT(i.id) as issue_count
+                 FROM batches b LEFT JOIN issues i ON b.batch_id = i.batch_id
+                 WHERE b.batch_id = ?
+                 GROUP BY b.batch_id"""
+        with self._conn() as conn:
+            row = conn.execute(sql, (batch_id,)).fetchone()
+            if row is None:
+                return None
+            return BatchInfo(
+                batch_id=row["batch_id"],
+                scan_path=row["scan_path"],
+                scanned_at=row["scanned_at"],
+                config_path=row["config_path"],
+                issue_count=row["issue_count"] or 0,
+                pending_count=row["pending_count"] or 0,
+                passed_count=row["passed_count"] or 0,
+                ignored_count=row["ignored_count"] or 0,
+            )
+
+    def get_previous_batch(self, batch_id: str) -> BatchInfo | None:
+        batch = self.get_batch(batch_id)
+        if batch is None:
+            return None
+        batches = self.list_batches(batch.scan_path)
+        found = False
+        for b in batches:
+            if b.batch_id == batch_id:
+                found = True
+                continue
+            if found:
+                return b
+        return None
+
+    def compare_batches(self, batch_old_id: str, batch_new_id: str) -> BatchDiffResult:
+        from .exceptions import BatchNotFoundError
+
+        batch_old = self.get_batch(batch_old_id)
+        if batch_old is None:
+            raise BatchNotFoundError(batch_old_id)
+        batch_new = self.get_batch(batch_new_id)
+        if batch_new is None:
+            raise BatchNotFoundError(batch_new_id)
+
+        old_issues = self.get_issues(batch_old_id)
+        new_issues = self.get_issues(batch_new_id)
+
+        old_by_fp: dict[str, IssueRecord] = {}
+        for i in old_issues:
+            if i.fingerprint:
+                old_by_fp[i.fingerprint] = i
+
+        new_by_fp: dict[str, IssueRecord] = {}
+        for i in new_issues:
+            if i.fingerprint:
+                new_by_fp[i.fingerprint] = i
+
+        added: list[IssueRecord] = []
+        removed: list[IssueRecord] = []
+        inherited: list[DiffIssueRecord] = []
+
+        for ni in new_issues:
+            if ni.fingerprint and ni.fingerprint in old_by_fp:
+                inherited.append(DiffIssueRecord(
+                    diff_type="inherited",
+                    issue=ni,
+                    old_issue=old_by_fp[ni.fingerprint],
+                ))
+            else:
+                added.append(ni)
+
+        for oi in old_issues:
+            if not oi.fingerprint or oi.fingerprint not in new_by_fp:
+                removed.append(oi)
+
+        return BatchDiffResult(
+            batch_old=batch_old,
+            batch_new=batch_new,
+            added=added,
+            removed=removed,
+            inherited=inherited,
+        )
 
     def get_issues(
         self,
@@ -480,25 +623,29 @@ class Storage:
         with self._conn() as conn:
             rows = conn.execute(sql, params).fetchall()
             return [
-                IssueRecord(
-                    id=r["id"],
-                    batch_id=r["batch_id"],
-                    project_path=r["project_path"],
-                    project_name=r["project_name"],
-                    project_type_id=r["project_type_id"],
-                    issue_type=r["issue_type"],
-                    severity=r["severity"],
-                    rule_name=r["rule_name"],
-                    file_path=r["file_path"],
-                    message=r["message"],
-                    fingerprint=r["fingerprint"] if "fingerprint" in r.keys() else None,
-                    state=r["state"],
-                    handler=r["handler"],
-                    note=r["note"],
-                    updated_at=r["updated_at"],
-                )
+                self._row_to_issue(r)
                 for r in rows
             ]
+
+    def _row_to_issue(self, r: sqlite3.Row) -> IssueRecord:
+        return IssueRecord(
+            id=r["id"],
+            batch_id=r["batch_id"],
+            project_path=r["project_path"],
+            project_name=r["project_name"],
+            project_type_id=r["project_type_id"],
+            issue_type=r["issue_type"],
+            severity=r["severity"],
+            rule_name=r["rule_name"],
+            file_path=r["file_path"],
+            message=r["message"],
+            fingerprint=r["fingerprint"] if "fingerprint" in r.keys() else None,
+            state=r["state"],
+            handler=r["handler"],
+            note=r["note"],
+            updated_at=r["updated_at"],
+            inherited_from_batch_id=r["inherited_from_batch_id"] if "inherited_from_batch_id" in r.keys() else None,
+        )
 
     def update_issue(
         self,
@@ -553,23 +700,7 @@ class Storage:
                 "SELECT * FROM issues WHERE id = ?", (issue_id,)
             ).fetchone()
 
-            return IssueRecord(
-                id=updated["id"],
-                batch_id=updated["batch_id"],
-                project_path=updated["project_path"],
-                project_name=updated["project_name"],
-                project_type_id=updated["project_type_id"],
-                issue_type=updated["issue_type"],
-                severity=updated["severity"],
-                rule_name=updated["rule_name"],
-                file_path=updated["file_path"],
-                message=updated["message"],
-                fingerprint=updated["fingerprint"] if "fingerprint" in updated.keys() else None,
-                state=updated["state"],
-                handler=updated["handler"],
-                note=updated["note"],
-                updated_at=updated["updated_at"],
-            )
+            return self._row_to_issue(updated)
 
     def undo_last(self, batch_id: str) -> UndoRecord:
         with self._tx() as conn:

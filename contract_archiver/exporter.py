@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from .storage import BatchInfo, IssueRecord, STATE_LABELS, FilterScheme
+from .storage import BatchDiffResult, DiffIssueRecord, DIFF_TYPE_LABELS
 
 
 STATE_CLASS = {
@@ -301,6 +302,273 @@ td.message {{ max-width: 400px; }}
 </table>
 
 {audit_html}
+
+<div class="footer">报告生成时间: {html.escape(now)}</div>
+</body>
+</html>"""
+
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(html_content)
+    return out
+
+
+DIFF_CLASS = {
+    "added": "diff-added",
+    "removed": "diff-removed",
+    "inherited": "diff-inherited",
+}
+
+
+def export_diff_csv(
+    diff: BatchDiffResult,
+    output_path: str | os.PathLike,
+) -> Path:
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(out, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "差异类型",
+            "旧批次ID", "旧批次扫描时间", "旧批次扫描路径",
+            "新批次ID", "新批次扫描时间", "新批次扫描路径",
+            "项目名称", "项目类型",
+            "问题类型", "严重程度",
+            "规则名", "文件路径",
+            "问题描述",
+            "当前状态", "处理人", "备注", "更新时间",
+            "指纹",
+            "继承来源批次",
+        ])
+
+        for issue in diff.added:
+            writer.writerow([
+                DIFF_TYPE_LABELS.get("added", "added"),
+                diff.batch_old.batch_id, diff.batch_old.scanned_at, diff.batch_old.scan_path,
+                diff.batch_new.batch_id, diff.batch_new.scanned_at, diff.batch_new.scan_path,
+                issue.project_name, issue.project_type_id or "",
+                issue.issue_label, issue.severity_label,
+                issue.rule_name or "", issue.file_path or "",
+                issue.message,
+                issue.state_label, issue.handler or "", issue.note or "", issue.updated_at or "",
+                issue.fingerprint or "",
+                issue.inherited_from_batch_id or "",
+            ])
+
+        for issue in diff.removed:
+            writer.writerow([
+                DIFF_TYPE_LABELS.get("removed", "removed"),
+                diff.batch_old.batch_id, diff.batch_old.scanned_at, diff.batch_old.scan_path,
+                diff.batch_new.batch_id, diff.batch_new.scanned_at, diff.batch_new.scan_path,
+                issue.project_name, issue.project_type_id or "",
+                issue.issue_label, issue.severity_label,
+                issue.rule_name or "", issue.file_path or "",
+                issue.message,
+                issue.state_label, issue.handler or "", issue.note or "", issue.updated_at or "",
+                issue.fingerprint or "",
+                "",
+            ])
+
+        for di in diff.inherited:
+            issue = di.issue
+            writer.writerow([
+                DIFF_TYPE_LABELS.get("inherited", "inherited"),
+                diff.batch_old.batch_id, diff.batch_old.scanned_at, diff.batch_old.scan_path,
+                diff.batch_new.batch_id, diff.batch_new.scanned_at, diff.batch_new.scan_path,
+                issue.project_name, issue.project_type_id or "",
+                issue.issue_label, issue.severity_label,
+                issue.rule_name or "", issue.file_path or "",
+                issue.message,
+                issue.state_label, issue.handler or "", issue.note or "", issue.updated_at or "",
+                issue.fingerprint or "",
+                issue.inherited_from_batch_id or "",
+            ])
+
+    return out
+
+
+def export_diff_html(
+    diff: BatchDiffResult,
+    output_path: str | os.PathLike,
+) -> Path:
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _issue_rows(issues: list[IssueRecord], diff_type: str) -> list[str]:
+        rows = []
+        for issue in issues:
+            state_cls = STATE_CLASS.get(issue.state, "")
+            sev_cls = SEVERITY_CLASS.get(issue.severity, "")
+            diff_cls = DIFF_CLASS.get(diff_type, "")
+            rows.append(
+                f'<tr class="{diff_cls}">'
+                f'<td><span class="diff-tag {diff_cls}">{DIFF_TYPE_LABELS.get(diff_type, diff_type)}</span></td>'
+                f'<td>{html.escape(issue.project_name)}</td>'
+                f'<td><span class="{sev_cls}">{html.escape(issue.issue_label)}</span></td>'
+                f'<td><span class="{sev_cls}">{html.escape(issue.severity_label)}</span></td>'
+                f"<td>{html.escape(issue.rule_name or '')}</td>"
+                f"<td>{html.escape(issue.file_path or '')}</td>"
+                f'<td class="message">{html.escape(issue.message)}</td>'
+                f'<td><span class="state-tag {state_cls}">{html.escape(issue.state_label)}</span></td>'
+                f"<td>{html.escape(issue.handler or '')}</td>"
+                f"<td>{html.escape(issue.note or '')}</td>"
+                f"<td>{html.escape(issue.updated_at or '')}</td>"
+                f"<td>{html.escape(issue.inherited_from_batch_id or '')}</td>"
+                f"</tr>"
+            )
+        return rows
+
+    def _inherited_rows(diff_issues: list[DiffIssueRecord]) -> list[str]:
+        rows = []
+        for di in diff_issues:
+            issue = di.issue
+            state_cls = STATE_CLASS.get(issue.state, "")
+            sev_cls = SEVERITY_CLASS.get(issue.severity, "")
+            diff_cls = DIFF_CLASS.get("inherited", "")
+            rows.append(
+                f'<tr class="{diff_cls}">'
+                f'<td><span class="diff-tag {diff_cls}">{DIFF_TYPE_LABELS.get("inherited", "inherited")}</span></td>'
+                f'<td>{html.escape(issue.project_name)}</td>'
+                f'<td><span class="{sev_cls}">{html.escape(issue.issue_label)}</span></td>'
+                f'<td><span class="{sev_cls}">{html.escape(issue.severity_label)}</span></td>'
+                f"<td>{html.escape(issue.rule_name or '')}</td>"
+                f"<td>{html.escape(issue.file_path or '')}</td>"
+                f'<td class="message">{html.escape(issue.message)}</td>'
+                f'<td><span class="state-tag {state_cls}">{html.escape(issue.state_label)}</span></td>'
+                f"<td>{html.escape(issue.handler or '')}</td>"
+                f"<td>{html.escape(issue.note or '')}</td>"
+                f"<td>{html.escape(issue.updated_at or '')}</td>"
+                f"<td>{html.escape(issue.inherited_from_batch_id or '')}</td>"
+                f"</tr>"
+            )
+        return rows
+
+    added_rows = _issue_rows(diff.added, "added")
+    removed_rows = _issue_rows(diff.removed, "removed")
+    inherited_rows = _inherited_rows(diff.inherited)
+
+    all_rows = added_rows + removed_rows + inherited_rows
+
+    path_same = diff.batch_old.scan_path == diff.batch_new.scan_path
+    path_info = (
+        f"扫描路径: <code>{html.escape(diff.batch_new.scan_path)}</code>"
+        if path_same
+        else f"""
+旧路径: <code>{html.escape(diff.batch_old.scan_path)}</code><br>
+新路径: <code>{html.escape(diff.batch_new.scan_path)}</code>
+"""
+    )
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>批次对比报告 - {html.escape(diff.batch_new.batch_id)}</title>
+<style>
+body {{ font-family: "Microsoft YaHei", "PingFang SC", sans-serif; margin: 24px; color: #333; }}
+h1 {{ margin-bottom: 8px; }}
+h2 {{ margin-top: 32px; border-bottom: 2px solid #333; padding-bottom: 6px; }}
+.meta {{ color: #666; margin-bottom: 24px; font-size: 14px; line-height: 1.8; }}
+.summary {{ display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; }}
+.card {{ padding: 12px 20px; border-radius: 6px; background: #f5f5f5; min-width: 120px; }}
+.card strong {{ display: block; font-size: 24px; }}
+.card span {{ font-size: 13px; color: #666; }}
+.card.added {{ background: #e8f5e9; }}
+.card.removed {{ background: #ffebee; }}
+.card.inherited {{ background: #e3f2fd; }}
+.card.old-total {{ background: #f3e5f5; }}
+.card.new-total {{ background: #fff8e1; }}
+table {{ border-collapse: collapse; width: 100%; font-size: 14px; }}
+th, td {{ padding: 8px 10px; text-align: left; border: 1px solid #ddd; vertical-align: top; }}
+th {{ background: #f0f0f0; position: sticky; top: 0; }}
+tr:hover td {{ background: #fafafa; }}
+tr.diff-added td {{ background: #f1f8e9; }}
+tr.diff-removed td {{ background: #ffebee; }}
+tr.diff-inherited td {{ background: #e8f0fe; }}
+tr.diff-added:hover td {{ background: #dcedc8; }}
+tr.diff-removed:hover td {{ background: #ffcdd2; }}
+tr.diff-inherited:hover td {{ background: #d2e3fc; }}
+td.message {{ max-width: 400px; }}
+.state-tag {{ display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 12px; font-weight: bold; }}
+.state-pending {{ background: #ffeb3b; color: #5d4037; }}
+.state-passed {{ background: #4caf50; color: #fff; }}
+.state-ignored {{ background: #9e9e9e; color: #fff; }}
+.diff-tag {{ display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; }}
+.diff-tag.diff-added {{ background: #4caf50; color: #fff; }}
+.diff-tag.diff-removed {{ background: #f44336; color: #fff; }}
+.diff-tag.diff-inherited {{ background: #2196f3; color: #fff; }}
+.sev-error {{ color: #c62828; font-weight: bold; }}
+.sev-warning {{ color: #ef6c00; font-weight: bold; }}
+.muted {{ color: #999; font-weight: normal; }}
+.footer {{ margin-top: 32px; color: #999; font-size: 12px; }}
+.batch-info {{ background: #f5f5f5; padding: 12px 16px; border-radius: 6px; margin-bottom: 16px; }}
+.batch-info .label {{ color: #666; font-size: 12px; }}
+.batch-info .value {{ font-weight: bold; font-size: 14px; }}
+.batch-compare {{ display: flex; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }}
+.batch-box {{ flex: 1; min-width: 280px; padding: 12px 16px; border-radius: 6px; border: 1px solid #ddd; }}
+.batch-box.old {{ background: #fafafa; }}
+.batch-box.new {{ background: #f0f8ff; border-color: #90caf9; }}
+.batch-box h3 {{ margin: 0 0 8px 0; font-size: 14px; color: #666; }}
+.batch-box .batch-id {{ font-size: 18px; font-weight: bold; margin-bottom: 6px; }}
+.batch-box .meta-row {{ font-size: 12px; color: #666; margin: 2px 0; }}
+</style>
+</head>
+<body>
+<h1>批次对比报告</h1>
+
+<div class="batch-compare">
+  <div class="batch-box old">
+    <h3>旧批次</h3>
+    <div class="batch-id">{html.escape(diff.batch_old.batch_id)}</div>
+    <div class="meta-row">扫描时间: {html.escape(diff.batch_old.scanned_at)}</div>
+    <div class="meta-row">问题数: {diff.total_old}</div>
+  </div>
+  <div style="display:flex;align-items:center;font-size:24px;color:#999;">→</div>
+  <div class="batch-box new">
+    <h3>新批次</h3>
+    <div class="batch-id">{html.escape(diff.batch_new.batch_id)}</div>
+    <div class="meta-row">扫描时间: {html.escape(diff.batch_new.scanned_at)}</div>
+    <div class="meta-row">问题数: {diff.total_new}</div>
+  </div>
+</div>
+
+<div class="meta">
+{path_info}
+</div>
+
+<h2>对比汇总</h2>
+<div class="summary">
+  <div class="card added"><strong>{diff.added_count}</strong><span>新增问题</span></div>
+  <div class="card removed"><strong>{diff.removed_count}</strong><span>消失问题</span></div>
+  <div class="card inherited"><strong>{diff.inherited_count}</strong><span>继承问题</span></div>
+  <div class="card old-total"><strong>{diff.total_old}</strong><span>旧批次总计</span></div>
+  <div class="card new-total"><strong>{diff.total_new}</strong><span>新批次总计</span></div>
+</div>
+
+<h2>差异明细</h2>
+<table>
+<thead>
+<tr>
+  <th>差异类型</th>
+  <th>项目名称</th>
+  <th>问题类型</th>
+  <th>严重度</th>
+  <th>规则名</th>
+  <th>文件路径</th>
+  <th>问题描述</th>
+  <th>状态</th>
+  <th>处理人</th>
+  <th>备注</th>
+  <th>更新时间</th>
+  <th>继承来源批次</th>
+</tr>
+</thead>
+<tbody>
+{''.join(all_rows) if all_rows else '<tr><td colspan="12" class="muted">无差异</td></tr>'}
+</tbody>
+</table>
 
 <div class="footer">报告生成时间: {html.escape(now)}</div>
 </body>

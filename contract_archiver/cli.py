@@ -14,11 +14,14 @@ from .exceptions import (
     MigrationPackageParseError,
     InvalidMigrationPackageError,
     SchemeImportConflictError,
+    BatchNotFoundError,
+    NoPreviousBatchError,
+    BatchPathMismatchWarning,
 )
-from .exporter import export_csv, export_html
+from .exporter import export_csv, export_html, export_diff_csv, export_diff_html
 from .rules import load_rules
 from .scanner import scan_directory
-from .storage import STATE_LABELS, Storage, FilterScheme
+from .storage import STATE_LABELS, Storage, FilterScheme, DIFF_TYPE_LABELS
 
 
 def _ensure_utf8_stdio() -> None:
@@ -299,6 +302,140 @@ def cmd_export(args: argparse.Namespace, storage: Storage) -> int:
     return 0
 
 
+def _resolve_diff_batches(args: argparse.Namespace, storage: Storage) -> tuple[str, str]:
+    batch_old = None
+    batch_new = None
+
+    if getattr(args, "batch1", None) and getattr(args, "batch2", None):
+        batch_old = args.batch1
+        batch_new = args.batch2
+    elif getattr(args, "batch", None):
+        b_new = storage.get_batch(args.batch)
+        if b_new is None:
+            raise BatchNotFoundError(args.batch)
+        batch_new = args.batch
+        prev = storage.get_previous_batch(args.batch)
+        if prev is None:
+            raise NoPreviousBatchError(args.batch, b_new.scan_path)
+        batch_old = prev.batch_id
+    elif getattr(args, "directory", None) and getattr(args, "latest", False):
+        batches = storage.list_batches(args.directory)
+        if not batches:
+            print(f"[错误] 路径 {args.directory} 没有任何扫描批次", file=sys.stderr)
+            sys.exit(2)
+        if len(batches) < 2:
+            first = batches[0]
+            raise NoPreviousBatchError(first.batch_id, first.scan_path)
+        batch_new = batches[0].batch_id
+        batch_old = batches[1].batch_id
+    else:
+        print("[错误] 请指定对比方式：\n"
+              "  1. --batch1 + --batch2：指定两个批次\n"
+              "  2. --batch：指定新批次，自动找上一批\n"
+              "  3. --directory --latest：指定路径，对比最新两批", file=sys.stderr)
+        sys.exit(2)
+
+    b_old_info = storage.get_batch(batch_old)
+    if b_old_info is None:
+        raise BatchNotFoundError(batch_old)
+    b_new_info = storage.get_batch(batch_new)
+    if b_new_info is None:
+        raise BatchNotFoundError(batch_new)
+
+    if b_old_info.scan_path != b_new_info.scan_path and not getattr(args, "ignore_path", False):
+        raise BatchPathMismatchWarning(
+            batch_old, b_old_info.scan_path,
+            batch_new, b_new_info.scan_path,
+        )
+
+    return batch_old, batch_new
+
+
+def _print_diff_table(diff) -> None:
+    print(f"\n{'差异类型':<6} {'类型':<8} {'严重度':<4} {'状态':<4} {'项目':<20} {'规则/文件':<30} 描述")
+    print("-" * 100)
+
+    for issue in diff.added:
+        target = issue.rule_name or issue.file_path or "-"
+        desc = issue.message[:45] + ("..." if len(issue.message) > 45 else "")
+        print(
+            f"{'新增':<6} {issue.issue_label:<8} {issue.severity_label:<4} "
+            f"{issue.state_label:<4} {issue.project_name[:20]:<20} {target[:30]:<30} {desc}"
+        )
+
+    for issue in diff.removed:
+        target = issue.rule_name or issue.file_path or "-"
+        desc = issue.message[:45] + ("..." if len(issue.message) > 45 else "")
+        print(
+            f"{'消失':<6} {issue.issue_label:<8} {issue.severity_label:<4} "
+            f"{issue.state_label:<4} {issue.project_name[:20]:<20} {target[:30]:<30} {desc}"
+        )
+
+    for di in diff.inherited:
+        issue = di.issue
+        target = issue.rule_name or issue.file_path or "-"
+        desc = issue.message[:45] + ("..." if len(issue.message) > 45 else "")
+        print(
+            f"{'继承':<6} {issue.issue_label:<8} {issue.severity_label:<4} "
+            f"{issue.state_label:<4} {issue.project_name[:20]:<20} {target[:30]:<30} {desc}"
+        )
+
+    print("-" * 100)
+    print(f"  新增: {diff.added_count}  |  消失: {diff.removed_count}  |  继承: {diff.inherited_count}")
+    print(f"  旧批次总计: {diff.total_old}  |  新批次总计: {diff.total_new}")
+
+
+def cmd_diff(args: argparse.Namespace, storage: Storage) -> int:
+    batch_old_id, batch_new_id = _resolve_diff_batches(args, storage)
+
+    b_old = storage.get_batch(batch_old_id)
+    b_new = storage.get_batch(batch_new_id)
+
+    print(f"[批次对比]")
+    print(f"  旧批次: {batch_old_id}  ({b_old.scanned_at})")
+    print(f"  新批次: {batch_new_id}  ({b_new.scanned_at})")
+    if b_old.scan_path == b_new.scan_path:
+        print(f"  扫描路径: {b_new.scan_path}")
+    else:
+        print(f"  旧路径: {b_old.scan_path}")
+        print(f"  新路径: {b_new.scan_path}")
+
+    config_changed = False
+    if b_old.config_path != b_new.config_path:
+        config_changed = True
+        print(f"  [提示] 配置文件不同：")
+        print(f"    旧配置: {b_old.config_path}")
+        print(f"    新配置: {b_new.config_path}")
+
+    diff = storage.compare_batches(batch_old_id, batch_new_id)
+
+    if diff.added_count > 0 and diff.removed_count > 0:
+        print(f"  [提示] 同时存在新增({diff.added_count})和消失({diff.removed_count})的问题")
+        print(f"    可能原因：规则配置变动（规则名/检测逻辑变更）、或数据真实变化")
+        if config_changed:
+            print(f"    建议：如仅为规则名调整，可忽略新增/消失，关注继承的问题状态")
+
+    out_path = getattr(args, "output", None)
+    fmt = getattr(args, "format", "table")
+
+    if out_path:
+        out = Path(out_path)
+        if fmt == "csv":
+            if not out.suffix:
+                out = out.with_suffix(".csv")
+            path = export_diff_csv(diff, out)
+        else:
+            if not out.suffix:
+                out = out.with_suffix(".html")
+            path = export_diff_html(diff, out)
+        print(f"\n[OK] 对比报告已导出: {path}")
+
+    if not out_path or fmt == "table" or True:
+        _print_diff_table(diff)
+
+    return 0
+
+
 def _format_scheme_conditions(scheme: FilterScheme) -> str:
     d = scheme.to_display_dict()
     if not d:
@@ -515,6 +652,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_exp.add_argument("--project-type", dest="project_type", help="按项目类型ID过滤问题")
     p_exp.add_argument("--scheme", help="使用已保存的筛选方案过滤问题")
     p_exp.set_defaults(func=cmd_export)
+
+    p_diff = sub.add_parser("diff", help="对比两个批次的问题差异")
+    p_diff.add_argument("-b", "--batch", help="指定新批次ID，自动找上一批对比")
+    p_diff.add_argument("--batch1", help="指定对比的旧批次ID（配合 --batch2 使用）")
+    p_diff.add_argument("--batch2", help="指定对比的新批次ID（配合 --batch1 使用）")
+    p_diff.add_argument("-d", "--directory", help="按扫描路径，对比最新两批（需配合 --latest）")
+    p_diff.add_argument("--latest", action="store_true", help="对比指定路径的最新两个批次")
+    p_diff.add_argument("-o", "--output", help="导出对比报告的文件路径")
+    p_diff.add_argument(
+        "-f", "--format", choices=["csv", "html", "table"], default="table",
+        help="输出/导出格式 (默认: table)",
+    )
+    p_diff.add_argument("--ignore-path", action="store_true", dest="ignore_path",
+                        help="忽略扫描路径不同的警告，强制对比")
+    p_diff.set_defaults(func=cmd_diff)
 
     p_scheme = sub.add_parser("scheme", help="筛选方案管理")
     scheme_sub = p_scheme.add_subparsers(dest="scheme_action", required=True)

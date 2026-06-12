@@ -5,9 +5,9 @@ import html
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
-from .storage import BatchInfo, IssueRecord
+from .storage import BatchInfo, IssueRecord, STATE_LABELS
 
 
 STATE_CLASS = {
@@ -21,11 +21,17 @@ SEVERITY_CLASS = {
     "warning": "sev-warning",
 }
 
+ACTION_LABELS = {
+    "update": "状态变更",
+    "undo": "撤销操作",
+}
+
 
 def export_csv(
     batch: BatchInfo,
     issues: Iterable[IssueRecord],
     output_path: str | os.PathLike,
+    audit_log: Sequence[dict] | None = None,
 ) -> Path:
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -57,6 +63,35 @@ def export_csv(
                 issue.note or "",
                 issue.updated_at or "",
             ])
+
+    if audit_log:
+        audit_out = out.with_name(out.stem + "_audit" + out.suffix)
+        with open(audit_out, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "批次ID", "时间", "操作类型",
+                "问题ID", "项目名称", "规则名", "文件路径",
+                "变更前状态", "变更后状态",
+                "变更前处理人", "变更后处理人",
+                "变更前备注", "变更后备注",
+            ])
+            for entry in audit_log:
+                writer.writerow([
+                    batch.batch_id,
+                    entry.get("timestamp", ""),
+                    ACTION_LABELS.get(entry.get("action", ""), entry.get("action", "")),
+                    entry.get("issue_id", ""),
+                    entry.get("project_name", ""),
+                    entry.get("rule_name", ""),
+                    entry.get("file_path", ""),
+                    STATE_LABELS.get(entry.get("old_state", ""), entry.get("old_state", "")),
+                    STATE_LABELS.get(entry.get("new_state", ""), entry.get("new_state", "")),
+                    entry.get("old_handler") or "",
+                    entry.get("new_handler") or "",
+                    entry.get("old_note") or "",
+                    entry.get("new_note") or "",
+                ])
+
     return out
 
 
@@ -64,6 +99,7 @@ def export_html(
     batch: BatchInfo,
     issues: list[IssueRecord],
     output_path: str | os.PathLike,
+    audit_log: Sequence[dict] | None = None,
 ) -> Path:
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -106,6 +142,54 @@ def export_html(
                 f"<td>{html.escape(issue.updated_at or '')}</td>"
                 f"</tr>"
             )
+
+    audit_html = ""
+    if audit_log:
+        audit_rows = []
+        for entry in audit_log:
+            old_state = STATE_LABELS.get(entry.get("old_state", ""), entry.get("old_state", ""))
+            new_state = STATE_LABELS.get(entry.get("new_state", ""), entry.get("new_state", ""))
+            action = ACTION_LABELS.get(entry.get("action", ""), entry.get("action", ""))
+            audit_rows.append(
+                f"<tr>"
+                f"<td>{html.escape(entry.get('timestamp', ''))}</td>"
+                f"<td>{html.escape(action)}</td>"
+                f"<td>#{html.escape(str(entry.get('issue_id', '')))}</td>"
+                f"<td>{html.escape(entry.get('project_name') or '')}</td>"
+                f"<td>{html.escape(entry.get('rule_name') or '')}</td>"
+                f"<td>{html.escape(entry.get('file_path') or '')}</td>"
+                f'<td><span class="state-tag {STATE_CLASS.get(entry.get("old_state", ""), "")}">{html.escape(old_state)}</span></td>'
+                f'<td><span class="state-tag {STATE_CLASS.get(entry.get("new_state", ""), "")}">{html.escape(new_state)}</span></td>'
+                f"<td>{html.escape(entry.get('old_handler') or '')}</td>"
+                f"<td>{html.escape(entry.get('new_handler') or '')}</td>"
+                f"<td>{html.escape(entry.get('old_note') or '')}</td>"
+                f"<td>{html.escape(entry.get('new_note') or '')}</td>"
+                f"</tr>"
+            )
+        audit_html = f"""
+<h2>操作历史（共 {len(audit_log)} 条）</h2>
+<table>
+<thead>
+<tr>
+  <th>时间</th>
+  <th>操作</th>
+  <th>问题ID</th>
+  <th>项目</th>
+  <th>规则名</th>
+  <th>文件</th>
+  <th>变更前状态</th>
+  <th>变更后状态</th>
+  <th>变更前处理人</th>
+  <th>变更后处理人</th>
+  <th>变更前备注</th>
+  <th>变更后备注</th>
+</tr>
+</thead>
+<tbody>
+{''.join(audit_rows)}
+</tbody>
+</table>
+"""
 
     html_content = f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -180,6 +264,8 @@ td.message {{ max-width: 400px; }}
 {''.join(rows_html) if rows_html else '<tr><td colspan="10" class="muted">暂无问题</td></tr>'}
 </tbody>
 </table>
+
+{audit_html}
 
 <div class="footer">报告生成时间: {html.escape(now)}</div>
 </body>

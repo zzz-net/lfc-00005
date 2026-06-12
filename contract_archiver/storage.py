@@ -37,6 +37,7 @@ class IssueRecord:
     rule_name: str | None
     file_path: str | None
     message: str
+    fingerprint: str | None = None
     state: str = "pending"
     handler: str | None = None
     note: str | None = None
@@ -153,8 +154,29 @@ class Storage:
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_undo_batch ON undo_log(batch_id);
+
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_id TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
+                    issue_id INTEGER NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+                    action TEXT NOT NULL,
+                    old_state TEXT NOT NULL,
+                    old_handler TEXT,
+                    old_note TEXT,
+                    new_state TEXT NOT NULL,
+                    new_handler TEXT,
+                    new_note TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_audit_batch ON audit_log(batch_id);
                 """
             )
+            try:
+                conn.execute("SELECT fingerprint FROM issues LIMIT 1")
+            except sqlite3.OperationalError:
+                conn.execute("ALTER TABLE issues ADD COLUMN fingerprint TEXT")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_issues_fingerprint ON issues(fingerprint)")
 
     def find_latest_batch(self, scan_path: str) -> Optional[BatchInfo]:
         resolved = str(Path(scan_path).resolve())
@@ -200,6 +222,23 @@ class Storage:
             if existing and not force:
                 raise DuplicateBatchError(resolved, existing["batch_id"])
 
+            fingerprint_map: dict[str, dict[str, Any]] = {}
+            inherited_count = 0
+            if existing:
+                old_issues = conn.execute(
+                    "SELECT fingerprint, state, handler, note, updated_at "
+                    "FROM issues WHERE batch_id = ? AND fingerprint IS NOT NULL",
+                    (existing["batch_id"],),
+                ).fetchall()
+                for row in old_issues:
+                    if row["fingerprint"]:
+                        fingerprint_map[row["fingerprint"]] = {
+                            "state": row["state"],
+                            "handler": row["handler"],
+                            "note": row["note"],
+                            "updated_at": row["updated_at"],
+                        }
+
             batch_id = datetime.now().strftime("%Y%m%d%H%M%S") + "_" + uuid.uuid4().hex[:8]
             scanned_at = scan_result.timestamp.isoformat(timespec="seconds")
             config_resolved = str(Path(config_path).resolve()) if config_path else None
@@ -212,11 +251,28 @@ class Storage:
             issue_count = 0
             for proj in scan_result.projects:
                 for issue in proj.issues:
+                    state = "pending"
+                    handler = None
+                    note = None
+                    updated_at = scanned_at
+                    inherited_from = None
+
+                    if issue.fingerprint and issue.fingerprint in fingerprint_map:
+                        inherit = fingerprint_map[issue.fingerprint]
+                        state = inherit["state"]
+                        handler = inherit["handler"]
+                        note = inherit["note"]
+                        if inherit["updated_at"]:
+                            updated_at = inherit["updated_at"]
+                        inherited_from = existing["batch_id"]
+                        inherited_count += 1
+
                     conn.execute(
                         """INSERT INTO issues
                         (batch_id, project_path, project_name, project_type_id,
-                         issue_type, severity, rule_name, file_path, message, state, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
+                         issue_type, severity, rule_name, file_path, message,
+                         fingerprint, state, handler, note, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             batch_id,
                             proj.project_path,
@@ -227,10 +283,17 @@ class Storage:
                             issue.rule_name,
                             issue.file_path,
                             issue.message,
-                            scanned_at,
+                            issue.fingerprint,
+                            state,
+                            handler,
+                            note,
+                            updated_at,
                         ),
                     )
                     issue_count += 1
+
+            if existing and inherited_count:
+                print(f"  [提示] 从旧批次 {existing['batch_id']} 继承了 {inherited_count} 个问题的状态")
 
             return batch_id, issue_count
 
@@ -293,6 +356,7 @@ class Storage:
                     rule_name=r["rule_name"],
                     file_path=r["file_path"],
                     message=r["message"],
+                    fingerprint=r["fingerprint"] if "fingerprint" in r.keys() else None,
                     state=r["state"],
                     handler=r["handler"],
                     note=r["note"],
@@ -341,6 +405,15 @@ class Storage:
                  state, new_handler, new_note, now),
             )
 
+            conn.execute(
+                """INSERT INTO audit_log
+                (batch_id, issue_id, action, old_state, old_handler, old_note,
+                 new_state, new_handler, new_note, created_at)
+                VALUES (?, ?, 'update', ?, ?, ?, ?, ?, ?, ?)""",
+                (batch_id, issue_id, old_state, old_handler, old_note,
+                 state, new_handler, new_note, now),
+            )
+
             updated = conn.execute(
                 "SELECT * FROM issues WHERE id = ?", (issue_id,)
             ).fetchone()
@@ -356,6 +429,7 @@ class Storage:
                 rule_name=updated["rule_name"],
                 file_path=updated["file_path"],
                 message=updated["message"],
+                fingerprint=updated["fingerprint"] if "fingerprint" in updated.keys() else None,
                 state=updated["state"],
                 handler=updated["handler"],
                 note=updated["note"],
@@ -389,6 +463,18 @@ class Storage:
                 (undo.old_state, undo.old_handler, undo.old_note, undo.created_at, undo.issue_id),
             )
 
+            now = datetime.now().isoformat(timespec="seconds")
+            conn.execute(
+                """INSERT INTO audit_log
+                (batch_id, issue_id, action, old_state, old_handler, old_note,
+                 new_state, new_handler, new_note, created_at)
+                VALUES (?, ?, 'undo', ?, ?, ?, ?, ?, ?, ?)""",
+                (batch_id, undo.issue_id,
+                 undo.new_state, undo.new_handler, undo.new_note,
+                 undo.old_state, undo.old_handler, undo.old_note,
+                 now),
+            )
+
             conn.execute("DELETE FROM undo_log WHERE id = ?", (undo.id,))
 
             return undo
@@ -400,3 +486,29 @@ class Storage:
                 (batch_id,),
             ).fetchone()
             return row["cnt"]
+
+    def get_audit_log(self, batch_id: str) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    a.action,
+                    a.issue_id,
+                    i.rule_name,
+                    i.file_path,
+                    i.project_name,
+                    a.old_state,
+                    a.new_state,
+                    a.old_handler,
+                    a.new_handler,
+                    a.old_note,
+                    a.new_note,
+                    a.created_at as timestamp
+                FROM audit_log a
+                JOIN issues i ON a.issue_id = i.id
+                WHERE a.batch_id = ?
+                ORDER BY a.created_at ASC, a.id ASC
+                """,
+                (batch_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]

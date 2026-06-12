@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from dataclasses import dataclass, field
@@ -54,10 +55,19 @@ class ScanIssue:
     file_path: str | None = None
     file_size_kb: float | None = None
     limit_kb: int | None = None
+    fingerprint: str | None = None
 
     @property
     def issue_label(self) -> str:
         return ISSUE_LABELS.get(self.issue_type, str(self.issue_type))
+
+
+def compute_fingerprint(project_path: str, *parts: str | None) -> str:
+    key_parts = [str(Path(project_path).resolve()).lower()]
+    for p in parts:
+        key_parts.append(str(p).lower() if p else "")
+    raw = "|".join(key_parts)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 
 @dataclass
@@ -103,8 +113,9 @@ def _scan_project(
     project_type: ProjectType,
     rules: ValidationRules,
 ) -> ProjectScanResult:
+    project_path = str(project_dir)
     result = ProjectScanResult(
-        project_path=str(project_dir),
+        project_path=project_path,
         project_name=project_dir.name,
         project_type_id=project_type.type_id,
         project_type_name=project_type.display_name,
@@ -141,6 +152,7 @@ def _scan_project(
                 severity=IssueSeverity.WARNING,
                 message=f"发现未纳入规则的子目录: {entry}",
                 file_path=rel_path,
+                fingerprint=compute_fingerprint(project_path, IssueType.UNDOCUMENTED.value, None, rel_path),
             ))
             continue
 
@@ -173,6 +185,7 @@ def _scan_project(
                 severity=IssueSeverity.WARNING,
                 message=f"文件未匹配任何附件规则: {entry}",
                 file_path=rel_path,
+                fingerprint=compute_fingerprint(project_path, IssueType.UNDOCUMENTED.value, None, rel_path),
             ))
         else:
             max_size_kb = _get_max_size(scanned.matched_rule, rules.global_max_size_kb)
@@ -183,6 +196,7 @@ def _scan_project(
                     message=f"文件为空: {entry}",
                     rule_name=scanned.matched_rule.name,
                     file_path=rel_path,
+                    fingerprint=compute_fingerprint(project_path, IssueType.EMPTY_FILE.value, scanned.matched_rule.name, rel_path),
                 ))
             elif max_size_kb is not None and size > max_size_kb * 1024:
                 result.issues.append(ScanIssue(
@@ -195,6 +209,7 @@ def _scan_project(
                     file_path=rel_path,
                     file_size_kb=round(size / 1024, 2),
                     limit_kb=max_size_kb,
+                    fingerprint=compute_fingerprint(project_path, IssueType.SIZE_EXCEEDED.value, scanned.matched_rule.name, rel_path),
                 ))
 
             if scanned.matched_rule.naming_pattern is not None:
@@ -207,6 +222,7 @@ def _scan_project(
                         ),
                         rule_name=scanned.matched_rule.name,
                         file_path=rel_path,
+                        fingerprint=compute_fingerprint(project_path, IssueType.NAMING_ERROR.value, scanned.matched_rule.name, rel_path),
                     ))
 
         seen_files.append(scanned)
@@ -220,6 +236,7 @@ def _scan_project(
                     severity=IssueSeverity.ERROR,
                     message=f"缺少必需附件: {rule.name}",
                     rule_name=rule.name,
+                    fingerprint=compute_fingerprint(project_path, IssueType.MISSING.value, rule.name, None),
                 ))
             continue
 
@@ -236,11 +253,13 @@ def _scan_project(
             for v, files in version_files.items():
                 if len(files) > 1:
                     names = ", ".join(f.rel_path for f in files)
+                    fp_rel = "|".join(sorted(f.rel_path for f in files))
                     result.issues.append(ScanIssue(
                         issue_type=IssueType.DUPLICATE_VERSION,
                         severity=IssueSeverity.ERROR,
                         message=f"版本 '{v}' 存在重复文件: {names}",
                         rule_name=rule.name,
+                        fingerprint=compute_fingerprint(project_path, IssueType.DUPLICATE_VERSION.value, rule.name, fp_rel),
                     ))
 
             highest = None
@@ -255,22 +274,27 @@ def _scan_project(
                 for v, files in version_files.items():
                     if v != highest:
                         names = ", ".join(f.rel_path for f in files)
+                        fp_rel = "|".join(sorted(f.rel_path for f in files))
+                        dup_severity = IssueSeverity.ERROR if rule.required else IssueSeverity.WARNING
                         result.issues.append(ScanIssue(
                             issue_type=IssueType.DUPLICATE_VERSION,
-                            severity=IssueSeverity.WARNING,
+                            severity=dup_severity,
                             message=(
                                 f"存在低优先级版本 '{v}'，建议使用最高版本 '{highest}': {names}"
                             ),
                             rule_name=rule.name,
+                            fingerprint=compute_fingerprint(project_path, IssueType.DUPLICATE_VERSION.value, rule.name, fp_rel),
                         ))
 
         elif len(matches) > 1:
             names = ", ".join(f.rel_path for f in matches)
+            fp_rel = "|".join(sorted(f.rel_path for f in matches))
             result.issues.append(ScanIssue(
                 issue_type=IssueType.DUPLICATE_VERSION,
                 severity=IssueSeverity.ERROR,
                 message=f"同一附件存在多个文件: {names}",
                 rule_name=rule.name,
+                fingerprint=compute_fingerprint(project_path, IssueType.DUPLICATE_VERSION.value, rule.name, fp_rel),
             ))
 
     result.files = seen_files

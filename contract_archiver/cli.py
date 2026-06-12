@@ -77,17 +77,47 @@ def cmd_list(args: argparse.Namespace, storage: Storage) -> int:
     if args.batch:
         issues = storage.get_issues(args.batch, state=args.state, severity=args.severity)
         if not issues:
-            print("  (无问题记录)")
+            if args.format == "json":
+                print("[]")
+            else:
+                print("  (无问题记录)")
             return 0
-        print(f"{'ID':>5} {'类型':<8} {'严重度':<4} {'状态':<4} {'项目':<20} {'规则/文件':<30} 描述")
-        for i in issues:
-            target = i.rule_name or i.file_path or "-"
-            desc = i.message[:50] + ("..." if len(i.message) > 50 else "")
-            print(
-                f"{i.id:>5} {i.issue_label:<8} {i.severity_label:<4} "
-                f"{i.state_label:<4} {i.project_name[:20]:<20} {target[:30]:<30} {desc}"
-            )
-        print(f"\n共 {len(issues)} 条记录")
+
+        if args.format == "json":
+            import json
+            data = []
+            for i in issues:
+                data.append({
+                    "id": i.id,
+                    "batch_id": i.batch_id,
+                    "project_path": i.project_path,
+                    "project_name": i.project_name,
+                    "project_type_id": i.project_type_id,
+                    "issue_type": i.issue_type,
+                    "issue_label": i.issue_label,
+                    "severity": i.severity,
+                    "severity_label": i.severity_label,
+                    "rule_name": i.rule_name,
+                    "file_path": i.file_path,
+                    "message": i.message,
+                    "state": i.state,
+                    "state_label": i.state_label,
+                    "handler": i.handler,
+                    "note": i.note,
+                    "updated_at": i.updated_at,
+                    "fingerprint": i.fingerprint,
+                })
+            print(json.dumps(data, ensure_ascii=False, indent=2))
+        else:
+            print(f"{'ID':>5} {'类型':<8} {'严重度':<4} {'状态':<4} {'项目':<20} {'规则/文件':<30} 描述")
+            for i in issues:
+                target = i.rule_name or i.file_path or "-"
+                desc = i.message[:50] + ("..." if len(i.message) > 50 else "")
+                print(
+                    f"{i.id:>5} {i.issue_label:<8} {i.severity_label:<4} "
+                    f"{i.state_label:<4} {i.project_name[:20]:<20} {target[:30]:<30} {desc}"
+                )
+            print(f"\n共 {len(issues)} 条记录")
     else:
         _print_batches(storage, args.directory)
     return 0
@@ -173,16 +203,20 @@ def cmd_export(args: argparse.Namespace, storage: Storage) -> int:
         return 2
 
     issues = storage.get_issues(args.batch)
+    audit_log = storage.get_audit_log(args.batch)
     out_path = Path(args.output)
 
     if args.format == "csv":
         if not out_path.suffix:
             out_path = out_path.with_suffix(".csv")
-        path = export_csv(batch, issues, out_path)
+        path = export_csv(batch, issues, out_path, audit_log=audit_log)
+        if audit_log:
+            audit_path = out_path.with_name(out_path.stem + "_audit" + out_path.suffix)
+            print(f"      审计轨迹: {audit_path}")
     else:
         if not out_path.suffix:
             out_path = out_path.with_suffix(".html")
-        path = export_html(batch, issues, out_path)
+        path = export_html(batch, issues, out_path, audit_log=audit_log)
 
     print(f"[OK] 报告已导出: {path}")
     return 0
@@ -210,6 +244,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_list.add_argument("-d", "--directory", help="按扫描路径过滤批次")
     p_list.add_argument("--state", choices=["pending", "passed", "ignored"], help="按状态过滤问题")
     p_list.add_argument("--severity", choices=["error", "warning"], help="按严重度过滤问题")
+    p_list.add_argument("--format", choices=["table", "json"], default="table", help="输出格式 (默认: table)")
     p_list.set_defaults(func=cmd_list)
 
     p_mark = sub.add_parser("mark", help="标记问题状态")

@@ -1,0 +1,24 @@
+project_types:
+  - type_id: caigou
+    display_name: 采购项目
+    directory_pattern: ".*采购.*"
+    attachments:
+      - name: 采购合同
+        naming_pattern: "^采购合同_(v\\d+)\\.(docx|pdf)$"
+        version_priority:
+          - v2
+          - v1
+        required: true
+      - name: 发票
+        naming_pattern: "^发票_(\\d{4})_(\\d{3})\\.pdf$"
+        required: true
+      - name: 验收单
+        naming_pattern: "^验收单_(\\d{4})_(\\d{3})\\.(docx|pdf)$"
+        required: false
+
+global_max_size_kb: 51200
+
+ignore_patterns:
+  - ".*\\.tmp$"
+  - ".*\\.swp$"
+  - "Thumbs\\.db$"

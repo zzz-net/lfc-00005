@@ -6,7 +6,15 @@ import os
 import sys
 from pathlib import Path
 
-from .exceptions import ContractArchiverError
+from .exceptions import (
+    ContractArchiverError,
+    DatabasePermissionError,
+    MigrationPackageEmptyError,
+    MigrationPackageMissingFieldError,
+    MigrationPackageParseError,
+    InvalidMigrationPackageError,
+    SchemeImportConflictError,
+)
 from .exporter import export_csv, export_html
 from .rules import load_rules
 from .scanner import scan_directory
@@ -324,7 +332,7 @@ def cmd_scheme_show(args: argparse.Namespace, storage: Storage) -> int:
 
 
 def cmd_scheme_save(args: argparse.Namespace, storage: Storage) -> int:
-    scheme = storage.save_scheme(
+    scheme, action = storage.save_scheme(
         name=args.name,
         batch_id=args.batch,
         state=args.state,
@@ -332,8 +340,9 @@ def cmd_scheme_save(args: argparse.Namespace, storage: Storage) -> int:
         project_type_id=args.project_type,
         overwrite=args.overwrite,
     )
-    action = "覆盖更新" if args.overwrite else "创建"
-    print(f"[OK] 已{action}方案「{scheme.name}」")
+    action_label = "覆盖更新" if action == "overwrite" else "创建"
+    print(f"[OK] 已{action_label}方案「{scheme.name}」")
+    print(f"  版本: v{scheme.version}")
     print(f"  筛选条件: {_format_scheme_conditions(scheme)}")
     return 0
 
@@ -341,6 +350,113 @@ def cmd_scheme_save(args: argparse.Namespace, storage: Storage) -> int:
 def cmd_scheme_delete(args: argparse.Namespace, storage: Storage) -> int:
     storage.delete_scheme(args.name)
     print(f"[OK] 已删除筛选方案「{args.name}」")
+    return 0
+
+
+def cmd_scheme_export(args: argparse.Namespace, storage: Storage) -> int:
+    names = None
+    if getattr(args, "name", None):
+        names = list(args.name)
+    out_path = Path(args.output)
+    if not out_path.suffix:
+        out_path = out_path.with_suffix(".json")
+    path = storage.export_schemes_to_file(out_path, names)
+    pkg = storage.export_schemes(names)
+    print(f"[OK] 已导出 {pkg['scheme_count']} 个方案到: {path}")
+    for s in pkg["schemes"]:
+        print(f"  - {s['name']} (v{s['version']})")
+    print(f"  导出时间: {pkg['exported_at']}")
+    print(f"  迁移包格式版本: v{pkg['package_version']}")
+    return 0
+
+
+def _format_import_result(result: dict) -> str:
+    lines = [f"[OK] 迁移包 {result['source_file']} 处理完成"]
+    lines.append(f"  总计: {result['total']} 个方案")
+    if result["created"]:
+        lines.append(f"  新增: {len(result['created'])} 个 - {', '.join(result['created'])}")
+    if result["overwritten"]:
+        lines.append(f"  覆盖: {len(result['overwritten'])} 个 - {', '.join(result['overwritten'])}")
+    if result["skipped"]:
+        lines.append(f"  跳过: {len(result['skipped'])} 个 - {', '.join(result['skipped'])}（同名冲突，未使用 --overwrite）")
+    if result["errors"]:
+        lines.append(f"  失败: {len(result['errors'])} 个")
+        for er in result["errors"]:
+            lines.append(f"    - {er['name']}: {er['reason']}")
+    return "\n".join(lines)
+
+
+def cmd_scheme_import(args: argparse.Namespace, storage: Storage) -> int:
+    from contract_archiver.exceptions import (
+        MigrationPackageError,
+    )
+    try:
+        result = storage.import_schemes(
+            file_path=args.input,
+            overwrite=args.overwrite,
+            preserve_timestamps=not args.no_preserve_timestamps,
+        )
+    except MigrationPackageError:
+        raise
+    except ContractArchiverError:
+        raise
+    except Exception as e:
+        print(f"[导入失败] {e}", file=sys.stderr)
+        return 3
+
+    print(_format_import_result(result))
+
+    if result["errors"] and not result["created"] and not result["overwritten"]:
+        return 3
+    if result["skipped"] and not args.overwrite and not result["created"] and not result["overwritten"]:
+        print("\n[提示] 上述方案因同名已存在被跳过，如需覆盖请加 --overwrite", file=sys.stderr)
+    return 0
+
+
+def cmd_scheme_undo(args: argparse.Namespace, storage: Storage) -> int:
+    from contract_archiver.exceptions import EmptyUndoError
+    if getattr(args, "count", False):
+        cnt = storage.get_scheme_undo_count()
+        print(f"可撤销方案操作数: {cnt}")
+        return 0
+    try:
+        undo = storage.undo_last_scheme_change(getattr(args, "name", None))
+    except EmptyUndoError:
+        print("[撤销失败] 没有可撤销的方案操作", file=sys.stderr)
+        return 1
+    print(f"[OK] 已撤销方案「{undo.scheme_name}」")
+    old_parts = []
+    if undo.old_batch_id:
+        old_parts.append(f"batch={undo.old_batch_id}")
+    if undo.old_state:
+        old_parts.append(f"state={undo.old_state}")
+    if undo.old_severity:
+        old_parts.append(f"severity={undo.old_severity}")
+    if undo.old_project_type_id:
+        old_parts.append(f"project_type={undo.old_project_type_id}")
+    print(f"  已还原为: {' + '.join(old_parts) if old_parts else '(无筛选条件)'}")
+    print(f"  原创建时间: {undo.old_created_at}")
+    print(f"  原更新时间: {undo.old_updated_at}")
+    remaining = storage.get_scheme_undo_count()
+    if remaining:
+        print(f"  剩余可撤销: {remaining} 条")
+    return 0
+
+
+def cmd_scheme_audit(args: argparse.Namespace, storage: Storage) -> int:
+    logs = storage.get_scheme_audit_log(getattr(args, "name", None))
+    if not logs:
+        print("  (无方案操作审计记录)")
+        return 0
+    print(f"{'时间':<20} {'操作':<12} {'方案名':<20} {'结果':<10}  来源/详情")
+    for lg in logs:
+        src = lg.get("source_file") or ""
+        detail = lg.get("detail") or ""
+        extra = src or detail
+        print(
+            f"{lg['created_at']:<20} {lg['action']:<12} "
+            f"{lg['scheme_name']:<20} {lg['result']:<10}  {extra}"
+        )
     return 0
 
 
@@ -423,6 +539,29 @@ def build_parser() -> argparse.ArgumentParser:
     ps_del.add_argument("name", help="方案名称")
     ps_del.set_defaults(func=cmd_scheme_delete)
 
+    ps_exp = scheme_sub.add_parser("export", help="导出筛选方案为迁移包 JSON")
+    ps_exp.add_argument("name", nargs="*", help="要导出的方案名（省略则导出全部）")
+    ps_exp.add_argument("-o", "--output", required=True, help="输出 JSON 文件路径")
+    ps_exp.set_defaults(func=cmd_scheme_export)
+
+    ps_imp = scheme_sub.add_parser("import", help="从迁移包 JSON 导入筛选方案")
+    ps_imp.add_argument("input", help="迁移包 JSON 文件路径")
+    ps_imp.add_argument("--overwrite", action="store_true", help="同名方案已存在时覆盖（默认跳过）")
+    ps_imp.add_argument(
+        "--no-preserve-timestamps", action="store_true",
+        help="不保留原 created_at/updated_at（使用当前时间），默认保留",
+    )
+    ps_imp.set_defaults(func=cmd_scheme_import)
+
+    ps_undo = scheme_sub.add_parser("undo", help="撤销最近一次方案覆盖/删除操作")
+    ps_undo.add_argument("name", nargs="?", default=None, help="撤销指定方案名的最近变更（省略则撤销最近）")
+    ps_undo.add_argument("--count", action="store_true", help="仅显示可撤销操作数量")
+    ps_undo.set_defaults(func=cmd_scheme_undo)
+
+    ps_audit = scheme_sub.add_parser("audit", help="查看方案操作审计日志")
+    ps_audit.add_argument("name", nargs="?", default=None, help="仅查看指定方案名的日志（省略则查看全部）")
+    ps_audit.set_defaults(func=cmd_scheme_audit)
+
     return parser
 
 
@@ -434,9 +573,39 @@ def main(argv: list[str] | None = None) -> int:
     try:
         storage = Storage(args.db)
         return args.func(args, storage)
+    except MigrationPackageEmptyError as e:
+        print(str(e), file=sys.stderr)
+        return 4
+    except MigrationPackageMissingFieldError as e:
+        print(str(e), file=sys.stderr)
+        return 5
+    except MigrationPackageParseError as e:
+        print(str(e), file=sys.stderr)
+        return 6
+    except InvalidMigrationPackageError as e:
+        print(str(e), file=sys.stderr)
+        return 7
+    except SchemeImportConflictError as e:
+        print(str(e), file=sys.stderr)
+        return 8
+    except DatabasePermissionError as e:
+        print(str(e), file=sys.stderr)
+        return 9
     except ContractArchiverError as e:
         print(str(e), file=sys.stderr)
         return 1
+    except FileNotFoundError as e:
+        print(f"[文件不存在] {e}", file=sys.stderr)
+        return 10
+    except IsADirectoryError as e:
+        print(f"[路径错误] 期望文件路径，实际是目录: {e}", file=sys.stderr)
+        return 10
+    except PermissionError as e:
+        print(f"[权限错误] 无法访问文件: {e}", file=sys.stderr)
+        return 11
+    except UnicodeDecodeError as e:
+        print(f"[编码错误] 文件不是 UTF-8 编码: {e}", file=sys.stderr)
+        return 12
     except KeyboardInterrupt:
         print("\n用户中断", file=sys.stderr)
         return 130

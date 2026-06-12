@@ -18,7 +18,13 @@ from .exceptions import (
     SchemeExistsError,
     EmptySchemeError,
     DatabasePermissionError,
+    MigrationPackageEmptyError,
+    MigrationPackageMissingFieldError,
+    MigrationPackageParseError,
+    InvalidMigrationPackageError,
+    SchemeImportConflictError,
 )
+from . import __version__ as PACKAGE_VERSION
 from .scanner import IssueSeverity, IssueType, ScanIssue, ScanResult, ProjectScanResult
 
 
@@ -97,6 +103,19 @@ class UndoRecord:
 
 
 @dataclass
+class SchemeUndoRecord:
+    id: int
+    scheme_name: str
+    old_batch_id: str | None
+    old_state: str | None
+    old_severity: str | None
+    old_project_type_id: str | None
+    old_created_at: str
+    old_updated_at: str
+    created_at: str
+
+
+@dataclass
 class FilterScheme:
     id: int
     name: str
@@ -106,6 +125,7 @@ class FilterScheme:
     project_type_id: str | None
     created_at: str
     updated_at: str
+    version: int = 1
 
     @property
     def is_empty(self) -> bool:
@@ -122,6 +142,18 @@ class FilterScheme:
         if self.project_type_id:
             labels["项目类型"] = self.project_type_id
         return labels
+
+    def to_migration_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "batch_id": self.batch_id,
+            "state": self.state,
+            "severity": self.severity,
+            "project_type_id": self.project_type_id,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "version": self.version,
+        }
 
 
 class Storage:
@@ -237,7 +269,32 @@ class Storage:
                     severity TEXT,
                     project_type_id TEXT,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 1
+                );
+
+                CREATE TABLE IF NOT EXISTS scheme_audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    action TEXT NOT NULL,
+                    scheme_name TEXT NOT NULL,
+                    source_file TEXT,
+                    result TEXT NOT NULL,
+                    detail TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_scheme_audit_name ON scheme_audit_log(scheme_name);
+
+                CREATE TABLE IF NOT EXISTS scheme_undo_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scheme_name TEXT NOT NULL UNIQUE,
+                    old_batch_id TEXT,
+                    old_state TEXT,
+                    old_severity TEXT,
+                    old_project_type_id TEXT,
+                    old_created_at TEXT NOT NULL,
+                    old_updated_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL
                 );
                 """
             )
@@ -246,6 +303,11 @@ class Storage:
             except sqlite3.OperationalError:
                 conn.execute("ALTER TABLE issues ADD COLUMN fingerprint TEXT")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_issues_fingerprint ON issues(fingerprint)")
+
+            try:
+                conn.execute("SELECT version FROM filter_schemes LIMIT 1")
+            except sqlite3.OperationalError:
+                conn.execute("ALTER TABLE filter_schemes ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
 
     def find_latest_batch(self, scan_path: str) -> Optional[BatchInfo]:
         resolved = str(Path(scan_path).resolve())
@@ -594,7 +656,10 @@ class Storage:
         severity: str | None = None,
         project_type_id: str | None = None,
         overwrite: bool = False,
-    ) -> FilterScheme:
+        source_file: str | None = None,
+        preserve_created_at: str | None = None,
+        preserve_updated_at: str | None = None,
+    ) -> tuple[FilterScheme, str]:
         name = name.strip()
         if not name:
             raise ValueError("方案名称不能为空")
@@ -607,6 +672,9 @@ class Storage:
             state = _validate_state(state)
 
         now = datetime.now().isoformat(timespec="seconds")
+        use_created_at = preserve_created_at or now
+        use_updated_at = preserve_updated_at or now
+        result_action = ""
 
         with self._tx() as conn:
             existing = conn.execute(
@@ -619,29 +687,73 @@ class Storage:
 
             if existing:
                 conn.execute(
-                    """UPDATE filter_schemes
-                    SET batch_id=?, state=?, severity=?, project_type_id=?, updated_at=?
-                    WHERE name=?""",
-                    (batch_id, state, severity, project_type_id, now, name),
+                    """INSERT OR REPLACE INTO scheme_undo_log
+                    (scheme_name, old_batch_id, old_state, old_severity, old_project_type_id,
+                     old_created_at, old_updated_at, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        name,
+                        existing["batch_id"],
+                        existing["state"],
+                        existing["severity"],
+                        existing["project_type_id"],
+                        existing["created_at"],
+                        existing["updated_at"],
+                        now,
+                    ),
                 )
+                new_version = (existing["version"] or 1) + 1
+                final_created_at = existing["created_at"] if preserve_created_at is None else preserve_created_at
+                conn.execute(
+                    """UPDATE filter_schemes
+                    SET batch_id=?, state=?, severity=?, project_type_id=?, updated_at=?, version=?, created_at=?
+                    WHERE name=?""",
+                    (batch_id, state, severity, project_type_id, use_updated_at, new_version, final_created_at, name),
+                )
+                result_action = "overwrite"
             else:
+                new_version = 1
                 try:
                     conn.execute(
                         """INSERT INTO filter_schemes
-                        (name, batch_id, state, severity, project_type_id, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                        (name, batch_id, state, severity, project_type_id, now, now),
+                        (name, batch_id, state, severity, project_type_id, created_at, updated_at, version)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (name, batch_id, state, severity, project_type_id, use_created_at, use_updated_at, new_version),
                     )
                 except sqlite3.IntegrityError as e:
                     if "UNIQUE" in str(e):
                         raise SchemeExistsError(name) from e
                     raise
+                result_action = "create"
+
+            audit_detail = []
+            if batch_id:
+                audit_detail.append(f"batch={batch_id}")
+            if state:
+                audit_detail.append(f"state={state}")
+            if severity:
+                audit_detail.append(f"severity={severity}")
+            if project_type_id:
+                audit_detail.append(f"project_type={project_type_id}")
+            conn.execute(
+                """INSERT INTO scheme_audit_log
+                (action, scheme_name, source_file, result, detail, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    "import" if source_file else "save",
+                    name,
+                    source_file,
+                    result_action,
+                    ";".join(audit_detail) if audit_detail else None,
+                    now,
+                ),
+            )
 
             row = conn.execute(
                 "SELECT * FROM filter_schemes WHERE name = ?",
                 (name,),
             ).fetchone()
-            return FilterScheme(
+            scheme = FilterScheme(
                 id=row["id"],
                 name=row["name"],
                 batch_id=row["batch_id"],
@@ -650,7 +762,9 @@ class Storage:
                 project_type_id=row["project_type_id"],
                 created_at=row["created_at"],
                 updated_at=row["updated_at"],
+                version=row["version"] or 1,
             )
+            return scheme, result_action
 
     def list_schemes(self) -> list[FilterScheme]:
         with self._conn() as conn:
@@ -667,6 +781,7 @@ class Storage:
                     project_type_id=r["project_type_id"],
                     created_at=r["created_at"],
                     updated_at=r["updated_at"],
+                    version=r["version"] or 1,
                 )
                 for r in rows
             ]
@@ -688,6 +803,7 @@ class Storage:
                 project_type_id=row["project_type_id"],
                 created_at=row["created_at"],
                 updated_at=row["updated_at"],
+                version=row["version"] or 1,
             )
 
     def delete_scheme(self, name: str) -> None:
@@ -698,4 +814,344 @@ class Storage:
             ).fetchone()
             if existing is None:
                 raise SchemeNotFoundError(name)
+            now = datetime.now().isoformat(timespec="seconds")
+            conn.execute(
+                """INSERT INTO scheme_audit_log
+                (action, scheme_name, source_file, result, detail, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                ("delete", name, None, "delete", None, now),
+            )
+            conn.execute("DELETE FROM scheme_undo_log WHERE scheme_name = ?", (name,))
             conn.execute("DELETE FROM filter_schemes WHERE name = ?", (name,))
+
+    @staticmethod
+    def _make_migration_package(schemes: list[FilterScheme]) -> dict[str, Any]:
+        return {
+            "package_version": 1,
+            "tool_version": PACKAGE_VERSION,
+            "exported_at": datetime.now().isoformat(timespec="seconds"),
+            "scheme_count": len(schemes),
+            "schemes": [s.to_migration_dict() for s in schemes],
+        }
+
+    def export_schemes(self, names: list[str] | None = None) -> dict[str, Any]:
+        schemes = self.list_schemes()
+        if names:
+            name_set = set(names)
+            missing = name_set - {s.name for s in schemes}
+            if missing:
+                raise SchemeNotFoundError(next(iter(missing)))
+            schemes = [s for s in schemes if s.name in name_set]
+        if not schemes:
+            raise SchemeNotFoundError("(无方案可导出)")
+        return self._make_migration_package(schemes)
+
+    def export_schemes_to_file(self, output_path: str | os.PathLike, names: list[str] | None = None) -> Path:
+        pkg = self.export_schemes(names)
+        out = Path(output_path)
+        out.write_text(json.dumps(pkg, ensure_ascii=False, indent=2), encoding="utf-8")
+        return out
+
+    @staticmethod
+    def _load_migration_package(file_path: str | os.PathLike) -> dict[str, Any]:
+        fp = Path(file_path)
+        abs_path = str(fp.resolve())
+        raw = fp.read_text(encoding="utf-8")
+        if not raw.strip():
+            raise MigrationPackageEmptyError(abs_path)
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise MigrationPackageParseError(abs_path, f"JSON 格式错误: {e.msg} (行{e.lineno}, 列{e.colno})") from e
+        if not isinstance(data, dict):
+            raise InvalidMigrationPackageError(f"文件 {abs_path} 顶层结构应为 JSON 对象，实际是 {type(data).__name__}")
+        if "schemes" not in data:
+            raise MigrationPackageMissingFieldError(abs_path, "schemes")
+        if not isinstance(data["schemes"], list):
+            raise InvalidMigrationPackageError(f"文件 {abs_path} 的 'schemes' 字段应为数组")
+        if not data["schemes"]:
+            raise MigrationPackageEmptyError(abs_path)
+        required_fields = {"name", "created_at", "updated_at", "version"}
+        optional_any = {"batch_id", "state", "severity", "project_type_id"}
+        for idx, s in enumerate(data["schemes"]):
+            if not isinstance(s, dict):
+                raise InvalidMigrationPackageError(
+                    f"文件 {abs_path} 第{idx + 1}个方案不是 JSON 对象"
+                )
+            for fld in required_fields:
+                if fld not in s:
+                    raise MigrationPackageMissingFieldError(abs_path, fld, idx)
+            if not isinstance(s["name"], str) or not s["name"].strip():
+                raise InvalidMigrationPackageError(
+                    f"文件 {abs_path} 第{idx + 1}个方案 'name' 字段为空或不是字符串"
+                )
+            has_any = any(s.get(f) is not None for f in optional_any)
+            if not has_any:
+                raise InvalidMigrationPackageError(
+                    f"文件 {abs_path} 第{idx + 1}个方案 '{s['name']}' 未指定任何筛选条件"
+                )
+        return data
+
+    def _log_scheme_audit(
+        self,
+        conn: sqlite3.Connection,
+        action: str,
+        scheme_name: str,
+        result: str,
+        source_file: str | None = None,
+        detail: str | None = None,
+    ) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        conn.execute(
+            """INSERT INTO scheme_audit_log
+            (action, scheme_name, source_file, result, detail, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)""",
+            (action, scheme_name, source_file, result, detail, now),
+        )
+
+    def import_schemes(
+        self,
+        file_path: str | os.PathLike,
+        overwrite: bool = False,
+        preserve_timestamps: bool = True,
+    ) -> dict[str, Any]:
+        fp = Path(file_path)
+        abs_path = str(fp.resolve())
+        pkg = self._load_migration_package(abs_path)
+
+        created: list[str] = []
+        overwritten: list[str] = []
+        skipped: list[str] = []
+        errors: list[dict[str, str]] = []
+
+        with self._tx() as conn:
+            for idx, s in enumerate(pkg["schemes"]):
+                name = s["name"].strip()
+                try:
+                    existing = conn.execute(
+                        "SELECT * FROM filter_schemes WHERE name = ?", (name,)
+                    ).fetchone()
+
+                    if existing and not overwrite:
+                        skipped.append(name)
+                        self._log_scheme_audit(
+                            conn, "import", name, "skip", source_file=abs_path,
+                            detail="方案已存在，未使用 --overwrite，已跳过"
+                        )
+                        continue
+
+                    state_val = s.get("state")
+                    if state_val is not None:
+                        try:
+                            state_val = _validate_state(state_val)
+                        except InvalidStateError:
+                            errors.append({
+                                "name": name,
+                                "reason": f"无效的 state 值: {state_val}",
+                            })
+                            self._log_scheme_audit(
+                                conn, "import", name, "error", source_file=abs_path,
+                                detail=f"无效 state 值: {state_val}"
+                            )
+                            continue
+
+                    severity_val = s.get("severity")
+                    if severity_val is not None and severity_val not in {"error", "warning"}:
+                        errors.append({
+                            "name": name,
+                            "reason": f"无效的 severity 值: {severity_val}（应为 error/warning）",
+                        })
+                        self._log_scheme_audit(
+                            conn, "import", name, "error", source_file=abs_path,
+                            detail=f"无效 severity 值: {severity_val}"
+                        )
+                        continue
+
+                    batch_val = s.get("batch_id")
+                    pt_val = s.get("project_type_id")
+                    version_val = int(s.get("version") or 1)
+
+                    if existing:
+                        conn.execute(
+                            """INSERT OR REPLACE INTO scheme_undo_log
+                            (scheme_name, old_batch_id, old_state, old_severity, old_project_type_id,
+                             old_created_at, old_updated_at, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                name, existing["batch_id"], existing["state"],
+                                existing["severity"], existing["project_type_id"],
+                                existing["created_at"], existing["updated_at"],
+                                datetime.now().isoformat(timespec="seconds"),
+                            ),
+                        )
+                        new_ver = max((existing["version"] or 1) + 1, version_val)
+                        final_created_at = (
+                            s["created_at"] if preserve_timestamps else existing["created_at"]
+                        )
+                        final_updated_at = s["updated_at"] if preserve_timestamps else datetime.now().isoformat(timespec="seconds")
+                        conn.execute(
+                            """UPDATE filter_schemes
+                            SET batch_id=?, state=?, severity=?, project_type_id=?,
+                                created_at=?, updated_at=?, version=?
+                            WHERE name=?""",
+                            (
+                                batch_val, state_val, severity_val, pt_val,
+                                final_created_at, final_updated_at, new_ver, name,
+                            ),
+                        )
+                        overwritten.append(name)
+                        result = "overwrite"
+                    else:
+                        final_created_at = s["created_at"] if preserve_timestamps else datetime.now().isoformat(timespec="seconds")
+                        final_updated_at = s["updated_at"] if preserve_timestamps else datetime.now().isoformat(timespec="seconds")
+                        try:
+                            conn.execute(
+                                """INSERT INTO filter_schemes
+                                (name, batch_id, state, severity, project_type_id, created_at, updated_at, version)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (
+                                    name, batch_val, state_val, severity_val, pt_val,
+                                    final_created_at, final_updated_at, version_val,
+                                ),
+                            )
+                        except sqlite3.IntegrityError as e:
+                            if "UNIQUE" in str(e):
+                                skipped.append(name)
+                                self._log_scheme_audit(
+                                    conn, "import", name, "skip", source_file=abs_path,
+                                    detail="并发插入导致 UNIQUE 冲突，已跳过"
+                                )
+                                continue
+                            raise
+                        created.append(name)
+                        result = "create"
+
+                    detail_parts = []
+                    if batch_val:
+                        detail_parts.append(f"batch={batch_val}")
+                    if state_val:
+                        detail_parts.append(f"state={state_val}")
+                    if severity_val:
+                        detail_parts.append(f"severity={severity_val}")
+                    if pt_val:
+                        detail_parts.append(f"project_type={pt_val}")
+                    self._log_scheme_audit(
+                        conn, "import", name, result, source_file=abs_path,
+                        detail=";".join(detail_parts) if detail_parts else None,
+                    )
+                except sqlite3.OperationalError as e:
+                    if _is_permission_error(e):
+                        raise
+                    sanitized = "数据操作失败"
+                    if not any(er["name"] == name for er in errors):
+                        errors.append({"name": name, "reason": sanitized})
+                except ContractArchiverError:
+                    raise
+                except Exception as e:
+                    sanitized = type(e).__name__
+                    err_msg = str(e)
+                    if "sqlite3" not in err_msg.lower() and "operational" not in err_msg.lower():
+                        sanitized = err_msg if len(err_msg) < 80 else err_msg[:77] + "..."
+                    if not any(er["name"] == name for er in errors):
+                        errors.append({"name": name, "reason": sanitized})
+                    try:
+                        self._log_scheme_audit(
+                            conn, "import", name, "error", source_file=abs_path,
+                            detail=sanitized[:500],
+                        )
+                    except Exception:
+                        pass
+
+        return {
+            "source_file": abs_path,
+            "package_version": pkg.get("package_version"),
+            "tool_version": pkg.get("tool_version"),
+            "exported_at": pkg.get("exported_at"),
+            "total": len(pkg["schemes"]),
+            "created": created,
+            "overwritten": overwritten,
+            "skipped": skipped,
+            "errors": errors,
+        }
+
+    def get_scheme_undo_count(self) -> int:
+        with self._conn() as conn:
+            row = conn.execute("SELECT COUNT(*) as cnt FROM scheme_undo_log").fetchone()
+            return row["cnt"] or 0
+
+    def undo_last_scheme_change(self, scheme_name: str | None = None) -> SchemeUndoRecord:
+        with self._tx() as conn:
+            if scheme_name:
+                row = conn.execute(
+                    "SELECT * FROM scheme_undo_log WHERE scheme_name = ?",
+                    (scheme_name,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM scheme_undo_log ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            if row is None:
+                raise EmptyUndoError()
+
+            undo = SchemeUndoRecord(
+                id=row["id"],
+                scheme_name=row["scheme_name"],
+                old_batch_id=row["old_batch_id"],
+                old_state=row["old_state"],
+                old_severity=row["old_severity"],
+                old_project_type_id=row["old_project_type_id"],
+                old_created_at=row["old_created_at"],
+                old_updated_at=row["old_updated_at"],
+                created_at=row["created_at"],
+            )
+
+            existing = conn.execute(
+                "SELECT id FROM filter_schemes WHERE name = ?", (undo.scheme_name,)
+            ).fetchone()
+
+            if existing:
+                conn.execute(
+                    """UPDATE filter_schemes
+                    SET batch_id=?, state=?, severity=?, project_type_id=?,
+                        created_at=?, updated_at=?, version = CASE WHEN version > 1 THEN version - 1 ELSE 1 END
+                    WHERE name=?""",
+                    (
+                        undo.old_batch_id, undo.old_state, undo.old_severity,
+                        undo.old_project_type_id, undo.old_created_at,
+                        undo.old_updated_at, undo.scheme_name,
+                    ),
+                )
+                result_action = "restore"
+            else:
+                conn.execute(
+                    """INSERT INTO filter_schemes
+                    (name, batch_id, state, severity, project_type_id, created_at, updated_at, version)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 1)""",
+                    (
+                        undo.scheme_name, undo.old_batch_id, undo.old_state,
+                        undo.old_severity, undo.old_project_type_id,
+                        undo.old_created_at, undo.old_updated_at,
+                    ),
+                )
+                result_action = "recreate"
+
+            now = datetime.now().isoformat(timespec="seconds")
+            conn.execute(
+                """INSERT INTO scheme_audit_log
+                (action, scheme_name, source_file, result, detail, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                ("undo_scheme", undo.scheme_name, None, result_action, None, now),
+            )
+            conn.execute("DELETE FROM scheme_undo_log WHERE id = ?", (undo.id,))
+            return undo
+
+    def get_scheme_audit_log(self, scheme_name: str | None = None) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM scheme_audit_log"
+        params: list[Any] = []
+        if scheme_name:
+            sql += " WHERE scheme_name = ?"
+            params.append(scheme_name)
+        sql += " ORDER BY created_at ASC, id ASC"
+        with self._conn() as conn:
+            rows = conn.execute(sql, params).fetchall()
+            return [dict(r) for r in rows]

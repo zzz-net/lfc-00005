@@ -54,7 +54,7 @@ def test_scheme_persistence(tmp_db: Path):
 
     # 创建第一个 Storage 实例并保存方案
     storage1 = Storage(tmp_db)
-    s1 = storage1.save_scheme(
+    s1, _ = storage1.save_scheme(
         name="法务常用-待补错误",
         batch_id="TEST_BATCH_001",
         state="pending",
@@ -111,7 +111,7 @@ def test_scheme_conflict_and_overwrite(tmp_db: Path):
     storage = Storage(tmp_db)
 
     # 第一次保存
-    s1 = storage.save_scheme(
+    s1, _ = storage.save_scheme(
         name="采购问题",
         state="pending",
         project_type_id="PURCHASE",
@@ -138,7 +138,7 @@ def test_scheme_conflict_and_overwrite(tmp_db: Path):
     print(f"  ✓ 未覆盖情况下原方案保持不变: state={s_old.state}")
 
     # 第三次同名加 overwrite - 应成功覆盖
-    s2 = storage.save_scheme(
+    s2, _ = storage.save_scheme(
         name="采购问题",
         state="passed",
         severity="warning",
@@ -639,6 +639,555 @@ def test_readonly_db_scheme_save(tmp_db: Path):
     print("测试6: 通过 ✓\n")
 
 
+def test_scheme_export_import_basic(work_dir: Path):
+    """测试7: 正常导出导入 - 单个方案和全部方案"""
+    import gc
+    import time
+    import shutil
+    import json
+
+    print("=" * 60)
+    print("测试7: 迁移包 - 正常导出导入")
+
+    src_db = work_dir / "src.db"
+    dst_db = work_dir / "dst.db"
+    export_all = work_dir / "all.json"
+    export_one = work_dir / "one.json"
+
+    # 源库创建 3 个方案
+    src = Storage(src_db)
+    s1, _ = src.save_scheme(name="方案A-法务待补", state="pending", severity="error", project_type_id="SALES")
+    time.sleep(0.1)
+    s2, _ = src.save_scheme(name="方案B-采购问题", state="pending", project_type_id="PURCHASE")
+    time.sleep(0.1)
+    s3, _ = src.save_scheme(name="方案C-忽略警告", state="ignored", severity="warning")
+    print(f"  ✓ 源库创建3个方案: A/B/C")
+
+    # 导出全部
+    rc, out, err = run_cli("--db", str(src_db), "scheme", "export", "-o", str(export_all))
+    assert_rc(rc, 0, out, err, "export all")
+    assert export_all.exists()
+    assert "方案A" in out and "方案B" in out and "方案C" in out
+    print("  ✓ CLI 导出全部方案成功")
+
+    pkg = json.loads(export_all.read_text(encoding="utf-8"))
+    assert pkg["scheme_count"] == 3
+    assert pkg["package_version"] == 1
+    assert "tool_version" in pkg and "exported_at" in pkg
+    names = {s["name"] for s in pkg["schemes"]}
+    assert {"方案A-法务待补", "方案B-采购问题", "方案C-忽略警告"} <= names
+    # 每个方案必须包含 8 个迁移字段
+    for s in pkg["schemes"]:
+        for fld in ("name", "batch_id", "state", "severity", "project_type_id",
+                    "created_at", "updated_at", "version"):
+            assert fld in s, f"迁移包方案缺少字段: {fld}"
+    print("  ✓ 迁移包结构正确: package_version, tool_version, exported_at, scheme_count, schemes[8字段]")
+
+    # 导出单个方案
+    rc, out, err = run_cli("--db", str(src_db), "scheme", "export", "方案A-法务待补", "-o", str(export_one))
+    assert_rc(rc, 0, out, err, "export one")
+    pkg_one = json.loads(export_one.read_text(encoding="utf-8"))
+    assert pkg_one["scheme_count"] == 1
+    assert pkg_one["schemes"][0]["name"] == "方案A-法务待补"
+    print("  ✓ CLI 导出单个方案成功")
+
+    # 导入到空目标库
+    rc, out, err = run_cli("--db", str(dst_db), "scheme", "import", str(export_all))
+    assert_rc(rc, 0, out, err, "import all")
+    assert "总计: 3" in out
+    assert "新增: 3 个" in out
+    print("  ✓ CLI 导入全部到空库成功")
+
+    # 验证时间戳和字段保留
+    dst = Storage(dst_db)
+    schemes_map = {s.name: s for s in dst.list_schemes()}
+    s_a_dst = schemes_map["方案A-法务待补"]
+    s_a_src = src.get_scheme("方案A-法务待补")
+    assert s_a_dst.created_at == s_a_src.created_at, (
+        f"import created_at 丢失: dst={s_a_dst.created_at} src={s_a_src.created_at}"
+    )
+    assert s_a_dst.updated_at == s_a_src.updated_at, (
+        f"import updated_at 丢失: dst={s_a_dst.updated_at} src={s_a_src.updated_at}"
+    )
+    assert s_a_dst.state == "pending"
+    assert s_a_dst.severity == "error"
+    assert s_a_dst.project_type_id == "SALES"
+    assert s_a_dst.version == s_a_src.version
+    print("  ✓ 导入后 created_at/updated_at/条件/version 全部保留")
+
+    # 审计日志
+    audits = dst.get_scheme_audit_log()
+    imported = [a for a in audits if a["action"] == "import" and a["result"] == "create"]
+    assert len(imported) == 3, f"应有3条导入审计记录, 实际={len(imported)}"
+    assert imported[0]["source_file"] == str(export_all.resolve())
+    print(f"  ✓ 审计日志: 3 条导入(create)记录, 来源文件={imported[0]['source_file']}")
+
+    del dst
+    gc.collect()
+    time.sleep(0.2)
+    shutil.rmtree(str(work_dir), ignore_errors=True)
+    print("测试7: 通过 ✓\n")
+
+
+def test_scheme_import_conflict(work_dir: Path):
+    """测试8: 导入同名冲突 - 默认跳过, --overwrite 覆盖"""
+    import gc
+    import time
+    import shutil
+    import json
+
+    print("=" * 60)
+    print("测试8: 迁移包 - 同名冲突跳过/覆盖")
+
+    src_db = work_dir / "src.db"
+    dst_db = work_dir / "dst.db"
+    pkg_file = work_dir / "pkg.json"
+
+    src = Storage(src_db)
+    src.save_scheme(name="冲突方案", state="pending", severity="error")
+    src.save_scheme(name="独有的方案", state="passed")
+    run_cli("--db", str(src_db), "scheme", "export", "-o", str(pkg_file))
+    print("  ✓ 源库: 冲突方案(pending/error) + 独有的方案(passed)")
+
+    dst = Storage(dst_db)
+    dst.save_scheme(name="冲突方案", state="ignored", project_type_id="PURCHASE")
+    dst_s_before = dst.get_scheme("冲突方案")
+    print(f"  ✓ 目标库: 冲突方案(ignored/PURCHASE) created_at={dst_s_before.created_at}")
+
+    # 默认跳过
+    rc, out, err = run_cli("--db", str(dst_db), "scheme", "import", str(pkg_file))
+    assert_rc(rc, 0, out, err, "import skip")
+    assert "跳过: 1 个" in out, f"应含跳过摘要, 实际out={out}"
+    assert "新增: 1 个" in out
+    assert "冲突方案" in out
+    dst_s = dst.get_scheme("冲突方案")
+    assert dst_s.state == "ignored", f"跳过但状态变了: {dst_s.state}"
+    assert dst_s.project_type_id == "PURCHASE"
+    assert dst_s.created_at == dst_s_before.created_at
+    print("  ✓ 默认跳过同名: 冲突方案保留原 state/severity/project_type/created_at")
+
+    # 跳过审计日志
+    audits = dst.get_scheme_audit_log("冲突方案")
+    skip_audits = [a for a in audits if a["action"] == "import" and a["result"] == "skip"]
+    assert len(skip_audits) >= 1
+    print("  ✓ 跳过操作写入 scheme_audit_log(result=skip)")
+
+    # --overwrite 覆盖
+    rc, out, err = run_cli("--db", str(dst_db), "scheme", "import", str(pkg_file), "--overwrite")
+    assert_rc(rc, 0, out, err, "import overwrite")
+    assert "覆盖: 1 个" in out or ("覆盖" in out and "冲突方案" in out)
+    dst_s2 = dst.get_scheme("冲突方案")
+    assert dst_s2.state == "pending", f"覆盖后应为pending: {dst_s2.state}"
+    assert dst_s2.severity == "error"
+    # created_at 按 preserve_timestamps 默认保留迁移包里的（保留规则：created_at/updated_at 默认保留迁移包原值）
+    print(f"  ✓ --overwrite 覆盖后: state={dst_s2.state}, severity={dst_s2.severity}, created_at={dst_s2.created_at}, version={dst_s2.version}")
+
+    # 独有方案也应存在
+    dst_other = dst.get_scheme("独有的方案")
+    assert dst_other.state == "passed"
+    print("  ✓ 非冲突的独有方案正确新增")
+
+    # --no-preserve-timestamps 测试
+    dst2_db = work_dir / "dst2.db"
+    dst2 = Storage(dst2_db)
+    dst2.save_scheme(name="冲突方案", state="ignored")
+    dst2_old = dst2.get_scheme("冲突方案")
+    time.sleep(0.2)
+    rc, out, err = run_cli(
+        "--db", str(dst2_db), "scheme", "import", str(pkg_file),
+        "--overwrite", "--no-preserve-timestamps",
+    )
+    assert_rc(rc, 0, out, err, "import overwrite no-preserve")
+    dst2_new = dst2.get_scheme("冲突方案")
+    assert dst2_new.state == "pending"
+    # --no-preserve-timestamps: 覆盖时 created_at 保留目标库原有值, updated_at 用当前时间
+    assert dst2_new.created_at == dst2_old.created_at, (
+        f"no-preserve覆盖应保留目标库created_at: dst={dst2_new.created_at} old={dst2_old.created_at}"
+    )
+    assert dst2_new.updated_at >= dst2_old.updated_at, (
+        f"no-preserve覆盖 updated_at 应更新: {dst2_new.updated_at} < {dst2_old.updated_at}"
+    )
+    print("  ✓ --no-preserve-timestamps: 覆盖保留目标库created_at, updated_at用当前")
+
+    del dst, dst2
+    gc.collect()
+    time.sleep(0.2)
+    shutil.rmtree(str(work_dir), ignore_errors=True)
+    print("测试8: 通过 ✓\n")
+
+
+def test_scheme_import_overwrite_undo(work_dir: Path):
+    """测试9: 覆盖导入后可用撤销机制回退"""
+    import gc
+    import time
+    import shutil
+
+    print("=" * 60)
+    print("测试9: 迁移包 - 覆盖导入 + 撤销")
+
+    src_db = work_dir / "src.db"
+    dst_db = work_dir / "dst.db"
+    pkg_file = work_dir / "pkg.json"
+
+    Storage(src_db).save_scheme(name="可撤销方案", state="pending", severity="error", project_type_id="SALES")
+    run_cli("--db", str(src_db), "scheme", "export", "-o", str(pkg_file))
+
+    dst = Storage(dst_db)
+    dst.save_scheme(name="可撤销方案", state="ignored", severity="warning", project_type_id="NDA")
+    before = dst.get_scheme("可撤销方案")
+    print(f"  覆盖前: state={before.state}, severity={before.severity}, project={before.project_type_id}")
+
+    # 覆盖
+    rc, out, err = run_cli("--db", str(dst_db), "scheme", "import", str(pkg_file), "--overwrite")
+    assert_rc(rc, 0, out, err, "import overwrite")
+    after = dst.get_scheme("可撤销方案")
+    assert after.state == "pending" and after.severity == "error" and after.project_type_id == "SALES"
+    print(f"  覆盖后: state={after.state}, severity={after.severity}, project={after.project_type_id}")
+
+    # 查看可撤销数
+    rc, out, err = run_cli("--db", str(dst_db), "scheme", "undo", "--count")
+    assert_rc(rc, 0, out, err, "undo count")
+    assert "可撤销方案操作数: 1" in out or "1" in out
+    print(f"  可撤销数: {out.strip()}")
+
+    # 执行撤销 - 指定方案名
+    rc, out, err = run_cli("--db", str(dst_db), "scheme", "undo", "可撤销方案")
+    assert_rc(rc, 0, out, err, "undo by name")
+    assert "已撤销" in out or "撤销" in out
+    restored = dst.get_scheme("可撤销方案")
+    assert restored.state == before.state, (
+        f"撤销后 state 应还原: {restored.state} != {before.state}"
+    )
+    assert restored.severity == before.severity
+    assert restored.project_type_id == before.project_type_id
+    assert restored.created_at == before.created_at
+    assert restored.updated_at == before.updated_at
+    print(f"  撤销后: state={restored.state}, severity={restored.severity}, project={restored.project_type_id}")
+    print("  ✓ 覆盖后撤销成功还原所有条件+时间戳")
+
+    # 无撤销可执行时报中文错
+    rc, out, err = run_cli("--db", str(dst_db), "scheme", "undo")
+    assert rc != 0
+    assert "没有可撤销" in err
+    assert "Traceback" not in err
+    print("  ✓ 无撤销时返回中文错误且无堆栈")
+
+    del dst
+    gc.collect()
+    time.sleep(0.2)
+    shutil.rmtree(str(work_dir), ignore_errors=True)
+    print("测试9: 通过 ✓\n")
+
+
+def test_scheme_import_bad_json(work_dir: Path):
+    """测试10: 坏 JSON / 缺字段 / 空文件 / 缺必填条件"""
+    import gc
+    import time
+    import shutil
+    import json
+
+    print("=" * 60)
+    print("测试10: 迁移包 - 错误输入全部中文报错+无堆栈")
+
+    dst_db = work_dir / "dst.db"
+
+    # (a) 空文件
+    empty = work_dir / "empty.json"
+    empty.write_text("", encoding="utf-8")
+    rc, out, err = run_cli("--db", str(dst_db), "scheme", "import", str(empty))
+    assert_rc(rc, 4, out, err, "import empty file")
+    assert "为空" in err
+    assert "Traceback" not in err
+    assert "json.JSONDecodeError" not in err
+    print(f"  ✓ 空文件 rc=4: {err.strip()[:60]}")
+
+    # (b) 坏 JSON
+    bad = work_dir / "bad.json"
+    bad.write_text("{ [ this is not valid ]", encoding="utf-8")
+    rc, out, err = run_cli("--db", str(dst_db), "scheme", "import", str(bad))
+    assert_rc(rc, 6, out, err, "import bad json")
+    assert "JSON" in err or "解析" in err
+    assert "Traceback" not in err
+    print(f"  ✓ 坏JSON rc=6: {err.strip()[:60]}")
+
+    # (c) 顶层缺 schemes 字段
+    miss_schemes = work_dir / "miss_schemes.json"
+    miss_schemes.write_text(json.dumps({"package_version": 1}, ensure_ascii=False), encoding="utf-8")
+    rc, out, err = run_cli("--db", str(dst_db), "scheme", "import", str(miss_schemes))
+    assert_rc(rc, 5, out, err, "import missing schemes field")
+    assert "缺少必填字段" in err and "schemes" in err
+    assert "Traceback" not in err
+    print(f"  ✓ 缺schemes字段 rc=5: {err.strip()[:60]}")
+
+    # (d) schemes里某个方案缺必填字段 version
+    miss_ver = work_dir / "miss_ver.json"
+    miss_ver.write_text(json.dumps({
+        "package_version": 1,
+        "schemes": [{
+            "name": "缺字段方案",
+            "state": "pending",
+            "created_at": "2024-01-01T00:00:00",
+            "updated_at": "2024-01-01T00:00:00",
+            # 缺 version
+        }]
+    }, ensure_ascii=False), encoding="utf-8")
+    rc, out, err = run_cli("--db", str(dst_db), "scheme", "import", str(miss_ver))
+    assert_rc(rc, 5, out, err, "import missing version field in scheme")
+    assert "缺少必填字段" in err and "version" in err
+    assert "Traceback" not in err
+    print(f"  ✓ 方案缺version rc=5: {err.strip()[:60]}")
+
+    # (e) schemes数组为空
+    empty_list = work_dir / "empty_list.json"
+    empty_list.write_text(json.dumps({
+        "package_version": 1, "schemes": []
+    }, ensure_ascii=False), encoding="utf-8")
+    rc, out, err = run_cli("--db", str(dst_db), "scheme", "import", str(empty_list))
+    assert_rc(rc, 4, out, err, "import empty schemes list")
+    assert "为空" in err
+    assert "Traceback" not in err
+    print(f"  ✓ schemes为空数组 rc=4: {err.strip()[:60]}")
+
+    # (f) 方案未指定任何筛选条件 (全None)
+    empty_cond = work_dir / "empty_cond.json"
+    empty_cond.write_text(json.dumps({
+        "package_version": 1,
+        "schemes": [{
+            "name": "全空方案",
+            "batch_id": None,
+            "state": None,
+            "severity": None,
+            "project_type_id": None,
+            "created_at": "2024-01-01T00:00:00",
+            "updated_at": "2024-01-01T00:00:00",
+            "version": 1,
+        }]
+    }, ensure_ascii=False), encoding="utf-8")
+    rc, out, err = run_cli("--db", str(dst_db), "scheme", "import", str(empty_cond))
+    assert_rc(rc, 7, out, err, "import scheme without any condition")
+    assert "未指定任何筛选条件" in err or "无效" in err
+    assert "Traceback" not in err
+    print(f"  ✓ 全None条件方案 rc=7: {err.strip()[:60]}")
+
+    # (g) 文件不存在
+    rc, out, err = run_cli("--db", str(dst_db), "scheme", "import", str(work_dir / "not_exist.json"))
+    assert rc != 0
+    assert "Traceback" not in err
+    assert "sqlite3" not in err
+    print(f"  ✓ 文件不存在 rc={rc}: {err.strip()[:60]}")
+
+    gc.collect()
+    time.sleep(0.2)
+    shutil.rmtree(str(work_dir), ignore_errors=True)
+    print("测试10: 通过 ✓\n")
+
+
+def test_scheme_import_cross_restart(work_dir: Path):
+    """测试11: 跨重启读取 - 导入后重启 Storage 仍存在且字段完整"""
+    import gc
+    import time
+    import shutil
+    import json
+
+    print("=" * 60)
+    print("测试11: 迁移包 - 跨重启读取")
+
+    src_db = work_dir / "src.db"
+    dst_db = work_dir / "dst.db"
+    pkg_file = work_dir / "pkg.json"
+
+    src = Storage(src_db)
+    s_a, _ = src.save_scheme(name="重启A", state="pending", severity="error", project_type_id="SALES")
+    s_b, _ = src.save_scheme(name="重启B", batch_id="BATCH_XYZ", state="passed")
+    run_cli("--db", str(src_db), "scheme", "export", "-o", str(pkg_file))
+
+    # 导入
+    rc, out, err = run_cli("--db", str(dst_db), "scheme", "import", str(pkg_file))
+    assert_rc(rc, 0, out, err, "import before restart")
+
+    # 关闭连接 模拟重启
+    del src
+    gc.collect()
+    time.sleep(0.3)
+
+    # 新 Storage 实例
+    dst = Storage(dst_db)
+    all_schemes = dst.list_schemes()
+    names = {s.name for s in all_schemes}
+    assert {"重启A", "重启B"} <= names, f"重启后方案缺失: {names}"
+    print("  ✓ 重启 Storage 后 list_schemes 仍有 2 个方案")
+
+    a = dst.get_scheme("重启A")
+    b = dst.get_scheme("重启B")
+    assert a.state == s_a.state and a.severity == s_a.severity and a.project_type_id == s_a.project_type_id
+    assert a.created_at == s_a.created_at and a.updated_at == s_a.updated_at
+    assert a.version == s_a.version
+    assert b.batch_id == s_b.batch_id and b.state == s_b.state
+    assert b.created_at == s_b.created_at
+    print("  ✓ 所有字段(state/severity/project_type/batch_id/created_at/updated_at/version)跨重启完整保留")
+
+    # 再重启 再验证
+    del dst
+    gc.collect()
+    time.sleep(0.2)
+    dst2 = Storage(dst_db)
+    a2 = dst2.get_scheme("重启A")
+    assert a2.state == "pending" and a2.severity == "error"
+    # 审计日志也跨重启
+    audits = dst2.get_scheme_audit_log()
+    assert len(audits) >= 2
+    print(f"  ✓ 二次重启仍完整, 审计日志{len(audits)}条")
+
+    del dst2
+    gc.collect()
+    time.sleep(0.2)
+    shutil.rmtree(str(work_dir), ignore_errors=True)
+    print("测试11: 通过 ✓\n")
+
+
+def test_scheme_import_readonly_db(work_dir: Path):
+    """测试12: 只读库导入失败 - 中文权限提示+无Python堆栈"""
+    import gc
+    import time
+    import shutil
+    import json
+
+    print("=" * 60)
+    print("测试12: 迁移包 - 只读库导入失败")
+
+    src_db = work_dir / "src.db"
+    dst_db = work_dir / "dst.db"
+    pkg_file = work_dir / "pkg.json"
+
+    Storage(src_db).save_scheme(name="只读测试方案", state="pending", severity="warning")
+    run_cli("--db", str(src_db), "scheme", "export", "-o", str(pkg_file))
+
+    # 先在正常模式建表 + 存一个方案(确保只读库有表结构)
+    dst = Storage(dst_db)
+    dst.save_scheme(name="原有只读库方案", state="ignored")
+    del dst
+    gc.collect()
+    time.sleep(0.3)
+
+    # 设为只读
+    import stat
+    dst_db.chmod(dst_db.stat().st_mode & ~stat.S_IWUSR & ~stat.S_IWGRP & ~stat.S_IWOTH)
+    print(f"  目标库已设为只读: {dst_db}")
+
+    try:
+        rc, out, err = run_cli("--db", str(dst_db), "scheme", "import", str(pkg_file))
+        print(f"  导入结果: rc={rc}")
+        print(f"  stderr: {err.strip()[:120]}")
+        assert rc != 0, f"只读库导入应返回非0 rc, 实际={rc}"
+        assert "数据库权限错误" in err or "权限" in err or "写入" in err, (
+            f"应有中文权限提示: {err}"
+        )
+        assert "Traceback" not in err, f"不应有 traceback: {err}"
+        assert "sqlite3.OperationalError" not in err, f"不应暴露 sqlite3 异常类名: {err}"
+        assert "attempt to write" not in err.lower(), f"不应暴露英文原始错误: {err}"
+        print("  ✓ 只读库导入: 非0退出码 + 中文权限提示 + 无堆栈 + 无原始sqlite3错误")
+    finally:
+        # 恢复
+        dst_db.chmod(dst_db.stat().st_mode | stat.S_IWUSR)
+
+    gc.collect()
+    time.sleep(0.2)
+    shutil.rmtree(str(work_dir), ignore_errors=True)
+    print("测试12: 通过 ✓\n")
+
+
+def test_scheme_cli_chain(work_dir: Path, rules_file: Path, sample_dir: Path):
+    """测试13: 完整命令链 - 扫描→保存方案→导出→清空目标库→导入→用方案list/export导出报告"""
+    import gc
+    import time
+    import shutil
+    import json
+
+    print("=" * 60)
+    print("测试13: 完整命令链 - 完整迁移场景")
+
+    pc_db = work_dir / "pc.db"
+    usb_db = work_dir / "usb.db"
+    pkg_file = work_dir / "法务常用方案.json"
+    out_csv = work_dir / "report.csv"
+
+    # --- 办公室PC: 扫描 + 保存常用方案 + 导出迁移包 ---
+    print("\n--- [PC端] 扫描目录 ---")
+    rc, out, err = run_cli("--db", str(pc_db), "scan", "-c", str(rules_file), "-d", str(sample_dir))
+    assert_rc(rc, 0, out, err, "scan")
+    batch_id = _extract_batch_id(out)
+    print(f"  batch_id={batch_id}")
+
+    print("\n--- [PC端] 保存2个常用筛选方案 ---")
+    rc, out, err = run_cli(
+        "--db", str(pc_db), "scheme", "save",
+        "法务-待补错误", "-b", batch_id, "--state", "pending", "--severity", "error",
+    )
+    assert_rc(rc, 0, out, err, "save 法务-待补错误")
+    print(f"  {out.strip().splitlines()[0]}")
+
+    rc, out, err = run_cli(
+        "--db", str(pc_db), "scheme", "save",
+        "采购类问题", "--state", "pending", "--project-type", "PURCHASE",
+    )
+    assert_rc(rc, 0, out, err, "save 采购类问题")
+    print(f"  {out.strip().splitlines()[0]}")
+
+    print("\n--- [PC端] 导出迁移包到U盘 ---")
+    rc, out, err = run_cli("--db", str(pc_db), "scheme", "export", "-o", str(pkg_file))
+    assert_rc(rc, 0, out, err, "export to usb file")
+    assert pkg_file.exists()
+    print(f"  迁移包: {pkg_file}")
+    pkg = json.loads(pkg_file.read_text(encoding="utf-8"))
+    assert pkg["scheme_count"] == 2
+    print(f"  含 {pkg['scheme_count']} 个方案, 生成于 {pkg['exported_at']}")
+
+    # --- 家里笔记本: 新库 + 导入迁移包 + 使用 ---
+    print("\n--- [笔记本端] 空库导入迁移包 ---")
+    rc, out, err = run_cli("--db", str(usb_db), "scheme", "import", str(pkg_file))
+    assert_rc(rc, 0, out, err, "import on laptop")
+    assert "新增: 2 个" in out
+    print(f"  {out.strip().splitlines()[0]}")
+
+    # 笔记本端还没有扫描批次，先做一次扫描
+    print("\n--- [笔记本端] 扫描相同资料目录 ---")
+    rc, out, err = run_cli("--db", str(usb_db), "scan", "-c", str(rules_file), "-d", str(sample_dir), "--force")
+    assert_rc(rc, 0, out, err, "laptop scan")
+    batch2 = _extract_batch_id(out)
+    print(f"  笔记本端batch={batch2}")
+
+    print("\n--- [笔记本端] 使用导入的方案+显式批次筛选问题 ---")
+    rc, out, err = run_cli(
+        "--db", str(usb_db), "list", "-b", batch2,
+        "--scheme", "法务-待补错误",
+    )
+    assert_rc(rc, 0, out, err, "list with scheme on laptop")
+    assert "使用筛选方案「法务-待补错误」" in out
+    print(f"  {out.strip().splitlines()[:3]}")
+
+    print("\n--- [笔记本端] 用方案导出CSV报告 ---")
+    rc, out, err = run_cli(
+        "--db", str(usb_db), "export", "-b", batch2,
+        "-o", str(out_csv), "-f", "csv",
+        "--scheme", "法务-待补错误",
+    )
+    assert_rc(rc, 0, out, err, "export csv by scheme")
+    assert out_csv.exists()
+    print(f"  CSV 报告: {out_csv}")
+
+    with open(out_csv, "r", encoding="utf-8-sig") as f:
+        first = f.readline()
+    assert "筛选方案" in first and "法务-待补错误" in first, (
+        f"CSV首行应有方案信息: {first}"
+    )
+    print("  ✓ CSV首行包含导入的方案名")
+
+    gc.collect()
+    time.sleep(0.2)
+    shutil.rmtree(str(work_dir), ignore_errors=True)
+    print("\n测试13: 通过 ✓\n")
+
+
 def main_tests():
     import gc
     import time
@@ -656,7 +1205,8 @@ def main_tests():
     failed = 0
     errors: list[tuple[str, str]] = []
 
-    tests = [
+    # 以 tmp_db 为参数的测试
+    per_db_tests = [
         ("test_scheme_persistence", lambda d: test_scheme_persistence(d)),
         ("test_scheme_conflict_and_overwrite", lambda d: test_scheme_conflict_and_overwrite(d)),
         ("test_scheme_empty_and_notfound", lambda d: test_scheme_empty_and_notfound(d)),
@@ -664,7 +1214,7 @@ def main_tests():
         ("test_readonly_db_scheme_save", lambda d: test_readonly_db_scheme_save(d)),
     ]
 
-    for name, test_fn in tests:
+    for name, test_fn in per_db_tests:
         td = tempfile.mkdtemp(prefix="cas_test_")
         tmp_db = Path(td) / "test.db"
         try:
@@ -683,23 +1233,57 @@ def main_tests():
             except Exception:
                 pass
 
-    # 完整链路测试使用独立临时目录
-    work_dir = tempfile.mkdtemp(prefix="cas_pipeline_")
-    try:
-        test_full_pipeline(rules_file, sample_dir)
-        passed += 1
-    except Exception as e:
-        failed += 1
-        errors.append(("test_full_pipeline", f"{type(e).__name__}: {e}"))
-        print(f"\n[X] test_full_pipeline 失败: {type(e).__name__}: {e}\n")
-    finally:
-        gc.collect()
-        time.sleep(0.2)
+    # 以 work_dir 为参数的迁移包测试（目录内多个db和json文件）
+    per_dir_tests = [
+        ("test_scheme_export_import_basic", lambda d: test_scheme_export_import_basic(Path(d))),
+        ("test_scheme_import_conflict", lambda d: test_scheme_import_conflict(Path(d))),
+        ("test_scheme_import_overwrite_undo", lambda d: test_scheme_import_overwrite_undo(Path(d))),
+        ("test_scheme_import_bad_json", lambda d: test_scheme_import_bad_json(Path(d))),
+        ("test_scheme_import_cross_restart", lambda d: test_scheme_import_cross_restart(Path(d))),
+        ("test_scheme_import_readonly_db", lambda d: test_scheme_import_readonly_db(Path(d))),
+    ]
+
+    for name, test_fn in per_dir_tests:
+        td = tempfile.mkdtemp(prefix="cas_mig_")
         try:
-            import shutil
-            shutil.rmtree(work_dir, ignore_errors=True)
-        except Exception:
-            pass
+            test_fn(td)
+            passed += 1
+        except Exception as e:
+            failed += 1
+            errors.append((name, f"{type(e).__name__}: {e}"))
+            print(f"\n[X] {name} 失败: {type(e).__name__}: {e}\n")
+        finally:
+            gc.collect()
+            time.sleep(0.2)
+            try:
+                import shutil
+                shutil.rmtree(td, ignore_errors=True)
+            except Exception:
+                pass
+
+    # 完整链路测试使用独立临时目录
+    pipeline_tests = [
+        ("test_full_pipeline", lambda d: test_full_pipeline(rules_file, sample_dir)),
+        ("test_scheme_cli_chain", lambda d: test_scheme_cli_chain(Path(d), rules_file, sample_dir)),
+    ]
+
+    for name, test_fn in pipeline_tests:
+        work_dir = tempfile.mkdtemp(prefix="cas_pipeline_")
+        try:
+            test_fn(work_dir)
+            passed += 1
+        except Exception as e:
+            failed += 1
+            errors.append((name, f"{type(e).__name__}: {e}"))
+            print(f"\n[X] {name} 失败: {type(e).__name__}: {e}\n")
+        finally:
+            gc.collect()
+            time.sleep(0.2)
+            try:
+                import shutil
+                shutil.rmtree(work_dir, ignore_errors=True)
+            except Exception:
+                pass
 
     print("=" * 60)
     print(f"测试完成: 通过 {passed}/{passed+failed}")

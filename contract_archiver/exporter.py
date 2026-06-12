@@ -59,6 +59,7 @@ def export_csv(
             "规则名", "文件路径",
             "问题描述", "状态", "处理人", "备注", "更新时间",
             "筛选方案", "方案条件",
+            "导入来源",
         ])
         for issue in issues:
             writer.writerow([
@@ -79,6 +80,7 @@ def export_csv(
                 issue.updated_at or "",
                 scheme_name,
                 scheme_conditions,
+                getattr(issue, "import_source", None) or "",
             ])
 
     if audit_log:
@@ -135,6 +137,19 @@ def export_html(
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    import_source_html = ""
+    import_meta_html = ""
+    first_issue = issues[0] if issues else None
+    if first_issue and getattr(first_issue, "import_source", None):
+        import_src = first_issue.import_source
+        import_meta_html = f" &nbsp;|&nbsp; 导入来源: <code style='background:#f3e5f5;color:#7b1fa2;'>{html.escape(import_src)}</code>"
+        import_source_html = f"""
+<div class="import-info" style="margin-bottom:24px;padding:16px;background:#f3e5f5;border:1px solid #ce93d8;border-radius:6px;">
+  <div style="font-size:13px;color:#6a1b9a;font-weight:bold;margin-bottom:8px;">📦 工作包导入数据</div>
+  <div><strong>导入来源:</strong> <code style='background:#e1bee7;color:#4a148c;'>{html.escape(import_src)}</code></div>
+</div>
+"""
+
     scheme_html = ""
     scheme_meta_html = ""
     if filter_scheme:
@@ -156,12 +171,14 @@ def export_html(
         project_issues = grouped[project_name]
         proj_type = project_issues[0].project_type_id or ""
         rows_html.append(
-            f'<tr class="project-header"><td colspan="11"><strong>{html.escape(project_name)}</strong>'
+            f'<tr class="project-header"><td colspan="12"><strong>{html.escape(project_name)}</strong>'
             f' <span class="muted">（类型: {html.escape(proj_type)}，共 {len(project_issues)} 个问题）</span></td></tr>'
         )
         for issue in project_issues:
             state_cls = STATE_CLASS.get(issue.state, "")
             sev_cls = SEVERITY_CLASS.get(issue.severity, "")
+            import_src = getattr(issue, "import_source", None) or ""
+            import_src_html = f'<code style="background:#f3e5f5;color:#7b1fa2;">{html.escape(import_src)}</code>' if import_src else ""
             rows_html.append(
                 f"<tr>"
                 f'<td>{issue.id}</td>'
@@ -174,6 +191,7 @@ def export_html(
                 f"<td>{html.escape(issue.handler or '')}</td>"
                 f"<td>{html.escape(issue.note or '')}</td>"
                 f"<td>{html.escape(issue.updated_at or '')}</td>"
+                f"<td>{import_src_html}</td>"
                 f"</tr>"
             )
 
@@ -265,9 +283,10 @@ td.message {{ max-width: 400px; }}
 <div class="meta">
 批次 ID: <strong>{html.escape(batch.batch_id)}</strong> &nbsp;|&nbsp;
 扫描路径: <code>{html.escape(batch.scan_path)}</code> &nbsp;|&nbsp;
-扫描时间: {html.escape(batch.scanned_at)}{scheme_meta_html}
+扫描时间: {html.escape(batch.scanned_at)}{scheme_meta_html}{import_meta_html}
 </div>
 
+{import_source_html}
 {scheme_html}
 
 <h2>问题汇总</h2>
@@ -294,10 +313,11 @@ td.message {{ max-width: 400px; }}
   <th>处理人</th>
   <th>备注</th>
   <th>更新时间</th>
+  <th>导入来源</th>
 </tr>
 </thead>
 <tbody>
-{''.join(rows_html) if rows_html else '<tr><td colspan="10" class="muted">暂无问题</td></tr>'}
+{''.join(rows_html) if rows_html else '<tr><td colspan="12" class="muted">暂无问题</td></tr>'}
 </tbody>
 </table>
 
@@ -339,6 +359,7 @@ def export_diff_csv(
             "当前状态", "处理人", "备注", "更新时间",
             "指纹",
             "继承来源批次",
+            "导入来源",
         ])
 
         for issue in diff.added:
@@ -353,6 +374,7 @@ def export_diff_csv(
                 issue.state_label, issue.handler or "", issue.note or "", issue.updated_at or "",
                 issue.fingerprint or "",
                 issue.inherited_from_batch_id or "",
+                getattr(issue, "import_source", None) or "",
             ])
 
         for issue in diff.removed:
@@ -367,6 +389,7 @@ def export_diff_csv(
                 issue.state_label, issue.handler or "", issue.note or "", issue.updated_at or "",
                 issue.fingerprint or "",
                 "",
+                getattr(issue, "import_source", None) or "",
             ])
 
         for di in diff.inherited:
@@ -382,6 +405,7 @@ def export_diff_csv(
                 issue.state_label, issue.handler or "", issue.note or "", issue.updated_at or "",
                 issue.fingerprint or "",
                 issue.inherited_from_batch_id or "",
+                getattr(issue, "import_source", None) or "",
             ])
 
     return out

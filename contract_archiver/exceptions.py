@@ -114,3 +114,67 @@ class BatchPathMismatchWarning(ContractArchiverError):
             f"  {batch2_id}: {path2}\n"
             f"路径不同的批次对比可能无意义，如确认后可使用 --ignore-path 强制执行"
         )
+
+
+class WorkPackageError(ContractArchiverError):
+    """工作包通用错误基类"""
+    pass
+
+
+class InvalidWorkPackageError(WorkPackageError):
+    def __init__(self, reason: str):
+        super().__init__(f"[工作包无效] {reason}")
+
+
+class WorkPackageEmptyError(WorkPackageError):
+    def __init__(self, file_path: str):
+        super().__init__(f"[工作包为空] 工作包文件 {file_path} 为空，没有可导入的内容")
+
+
+class WorkPackageParseError(WorkPackageError):
+    def __init__(self, file_path: str, detail: str):
+        super().__init__(f"[工作包解析失败] 无法解析文件 {file_path}: {detail}")
+
+
+class WorkPackageMissingFieldError(WorkPackageError):
+    def __init__(self, file_path: str, field: str, section: str | None = None):
+        pos = f"（{section}）" if section else ""
+        super().__init__(
+            f"[工作包缺字段] 文件 {file_path}{pos} 缺少必填字段: {field}"
+        )
+
+
+class WorkPackageBatchExistsError(WorkPackageError):
+    def __init__(self, batch_id: str):
+        super().__init__(
+            f"[导入冲突] 批次 {batch_id} 已存在，使用 --overwrite-batch 可覆盖批次及其问题"
+        )
+
+
+class WorkPackageIssueStateConflictError(WorkPackageError):
+    def __init__(self, issue_id: int, project_name: str, rule_name: str | None):
+        target = rule_name or "(未知规则)"
+        super().__init__(
+            f"[状态冲突] 问题 #{issue_id} ({project_name} - {target}) 已有状态，"
+            f"使用 --overwrite-state 可覆盖状态和备注"
+        )
+
+
+class WorkPackageRuleMismatchError(WorkPackageError):
+    def __init__(self, batch_id: str, detail: str):
+        super().__init__(
+            f"[规则摘要不一致] 批次 {batch_id} 的规则配置摘要与本地不同：{detail}。"
+            f"导入后可能导致后续扫描对比异常，如确认可继续使用 --ignore-rule-mismatch"
+        )
+
+
+class WorkPackageSchemeExistsError(WorkPackageError):
+    def __init__(self, scheme_name: str):
+        super().__init__(
+            f"[方案冲突] 筛选方案 '{scheme_name}' 已存在，使用 --overwrite-scheme 可覆盖"
+        )
+
+
+class EmptyWorkPackageUndoError(ContractArchiverError):
+    def __init__(self):
+        super().__init__("[撤销失败] 没有可撤销的工作包导入操作")

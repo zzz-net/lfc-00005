@@ -1,0 +1,70 @@
+{
+  "package_version": 1,
+  "tool_version": "1.0.0",
+  "exported_at": "2026-06-13T06:02:14",
+  "package_type": "work_package",
+  "batch": {
+    "batch_id": "20260613060203_07e68631",
+    "scan_path": "D:\\workSpace\\AI__SPACE\\lfc-00005\\reviewer_inputs\\scan_case",
+    "scanned_at": "2026-06-13T06:02:03.204132",
+    "config_path": "D:\\workSpace\\AI__SPACE\\lfc-00005\\examples\\rules.yaml",
+    "issue_count": 1,
+    "pending_count": 0,
+    "passed_count": 1,
+    "ignored_count": 0
+  },
+  "issues": [
+    {
+      "id": 1,
+      "project_path": "D:\\workSpace\\AI__SPACE\\lfc-00005\\reviewer_inputs\\scan_case\\2025-采购合同-Reviewer供应商",
+      "project_name": "2025-采购合同-Reviewer供应商",
+      "project_type_id": "PURCHASE",
+      "issue_type": "duplicate_version",
+      "severity": "error",
+      "rule_name": "主合同",
+      "file_path": null,
+      "message": "存在低优先级版本 'v1'，建议使用最高版本 'v2': 采购合同v1.docx",
+      "fingerprint": "0c5b3b5101188c5c",
+      "state": "passed",
+      "handler": "ReviewerA",
+      "note": "reviewer-owned state",
+      "updated_at": "2026-06-13T06:02:14",
+      "inherited_from_batch_id": null
+    }
+  ],
+  "rule_summary": {
+    "project_type_count": 3,
+    "rule_names": [
+      "主合同",
+      "营业执照",
+      "法人身份证",
+      "授权委托书",
+      "报价单",
+      "主合同",
+      "供应商资质",
+      "报价单",
+      "验收单",
+      "保密协议"
+    ],
+    "global_max_size_kb": 51200,
+    "config_path": "D:\\workSpace\\AI__SPACE\\lfc-00005\\examples\\rules.yaml",
+    "config_hash": "566c4ba00c33f038"
+  },
+  "undo_history": {
+    "total_undo_count": 1,
+    "last_undo_time": "2026-06-13T06:02:14",
+    "last_undo_action": "update"
+  },
+  "schemes": [
+    {
+      "name": "reviewer-scheme",
+      "batch_id": "20260613060203_07e68631",
+      "state": "passed",
+      "severity": "error",
+      "project_type_id": null,
+      "created_at": "2026-06-13T06:02:14",
+      "updated_at": "2026-06-13T06:02:14",
+      "version": 1
+    }
+  ]
+}

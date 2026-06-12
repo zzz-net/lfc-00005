@@ -23,6 +23,16 @@ from .exceptions import (
     MigrationPackageParseError,
     InvalidMigrationPackageError,
     SchemeImportConflictError,
+    WorkPackageError,
+    InvalidWorkPackageError,
+    WorkPackageEmptyError,
+    WorkPackageParseError,
+    WorkPackageMissingFieldError,
+    WorkPackageBatchExistsError,
+    WorkPackageIssueStateConflictError,
+    WorkPackageRuleMismatchError,
+    WorkPackageSchemeExistsError,
+    EmptyWorkPackageUndoError,
 )
 from . import __version__ as PACKAGE_VERSION
 from .scanner import IssueSeverity, IssueType, ScanIssue, ScanResult, ProjectScanResult
@@ -62,6 +72,7 @@ class IssueRecord:
     note: str | None = None
     updated_at: str | None = None
     inherited_from_batch_id: str | None = None
+    import_source: str | None = None
 
     @property
     def state_label(self) -> str:
@@ -161,6 +172,86 @@ class SchemeUndoRecord:
     old_created_at: str
     old_updated_at: str
     created_at: str
+
+
+@dataclass
+class ImportUndoRecord:
+    id: int
+    import_source: str
+    import_source_file: str | None
+    batch_id: str
+    imported_issue_ids: list[int]
+    imported_scheme_names: list[str]
+    created_at: str
+
+
+@dataclass
+class RuleConfigSummary:
+    project_type_count: int
+    rule_names: list[str]
+    global_max_size_kb: int | None
+    config_path: str | None
+    config_hash: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "project_type_count": self.project_type_count,
+            "rule_names": list(self.rule_names),
+            "global_max_size_kb": self.global_max_size_kb,
+            "config_path": self.config_path,
+            "config_hash": self.config_hash,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "RuleConfigSummary":
+        return cls(
+            project_type_count=d["project_type_count"],
+            rule_names=list(d["rule_names"]),
+            global_max_size_kb=d.get("global_max_size_kb"),
+            config_path=d.get("config_path"),
+            config_hash=d["config_hash"],
+        )
+
+    def compare(self, other: "RuleConfigSummary") -> list[str]:
+        diffs = []
+        if self.project_type_count != other.project_type_count:
+            diffs.append(f"项目类型数量: {self.project_type_count} vs {other.project_type_count}")
+        if set(self.rule_names) != set(other.rule_names):
+            missing = set(other.rule_names) - set(self.rule_names)
+            extra = set(self.rule_names) - set(other.rule_names)
+            parts = []
+            if missing:
+                parts.append(f"缺失规则: {', '.join(missing)}")
+            if extra:
+                parts.append(f"多余规则: {', '.join(extra)}")
+            diffs.append("规则名集合不同 - " + "; ".join(parts))
+        if self.global_max_size_kb != other.global_max_size_kb:
+            diffs.append(f"全局大小限制: {self.global_max_size_kb} vs {other.global_max_size_kb}")
+        if self.config_hash != other.config_hash:
+            diffs.append("配置内容哈希不同")
+        return diffs
+
+
+@dataclass
+class UndoHistorySummary:
+    total_undo_count: int
+    last_undo_time: str | None
+    last_undo_action: str | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "total_undo_count": self.total_undo_count,
+            "last_undo_time": self.last_undo_time,
+            "last_undo_action": self.last_undo_action,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "UndoHistorySummary":
+        return cls(
+            total_undo_count=d["total_undo_count"],
+            last_undo_time=d.get("last_undo_time"),
+            last_undo_action=d.get("last_undo_action"),
+        )
 
 
 @dataclass
@@ -362,6 +453,50 @@ class Storage:
             except sqlite3.OperationalError:
                 conn.execute("ALTER TABLE issues ADD COLUMN inherited_from_batch_id TEXT")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_issues_inherited_from ON issues(inherited_from_batch_id)")
+
+            try:
+                conn.execute("SELECT import_source FROM issues LIMIT 1")
+            except sqlite3.OperationalError:
+                conn.execute("ALTER TABLE issues ADD COLUMN import_source TEXT")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_issues_import_source ON issues(import_source)")
+
+            try:
+                conn.execute("SELECT import_source FROM batches LIMIT 1")
+            except sqlite3.OperationalError:
+                conn.execute("ALTER TABLE batches ADD COLUMN import_source TEXT")
+                conn.execute("ALTER TABLE batches ADD COLUMN rule_summary_json TEXT")
+                conn.execute("ALTER TABLE batches ADD COLUMN imported_at TEXT")
+
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS import_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    import_source TEXT NOT NULL,
+                    import_source_file TEXT,
+                    batch_id TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
+                    imported_issue_ids TEXT NOT NULL,
+                    imported_scheme_names TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_import_log_batch ON import_log(batch_id);
+                CREATE INDEX IF NOT EXISTS idx_import_log_source ON import_log(import_source);
+
+                CREATE TABLE IF NOT EXISTS import_undo_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    import_source TEXT NOT NULL,
+                    import_source_file TEXT,
+                    batch_id TEXT NOT NULL,
+                    old_batch_import_source TEXT,
+                    old_batch_imported_at TEXT,
+                    old_issue_states TEXT NOT NULL,
+                    old_schemes TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_import_undo_batch ON import_undo_log(batch_id);
+                """
+            )
 
     def find_latest_batch(self, scan_path: str) -> Optional[BatchInfo]:
         resolved = str(Path(scan_path).resolve())
@@ -628,6 +763,7 @@ class Storage:
             ]
 
     def _row_to_issue(self, r: sqlite3.Row) -> IssueRecord:
+        keys = set(r.keys())
         return IssueRecord(
             id=r["id"],
             batch_id=r["batch_id"],
@@ -639,12 +775,13 @@ class Storage:
             rule_name=r["rule_name"],
             file_path=r["file_path"],
             message=r["message"],
-            fingerprint=r["fingerprint"] if "fingerprint" in r.keys() else None,
+            fingerprint=r["fingerprint"] if "fingerprint" in keys else None,
             state=r["state"],
             handler=r["handler"],
             note=r["note"],
             updated_at=r["updated_at"],
-            inherited_from_batch_id=r["inherited_from_batch_id"] if "inherited_from_batch_id" in r.keys() else None,
+            inherited_from_batch_id=r["inherited_from_batch_id"] if "inherited_from_batch_id" in keys else None,
+            import_source=r["import_source"] if "import_source" in keys else None,
         )
 
     def update_issue(
@@ -1286,3 +1423,610 @@ class Storage:
         with self._conn() as conn:
             rows = conn.execute(sql, params).fetchall()
             return [dict(r) for r in rows]
+
+    def _compute_rule_summary(self, config_path: str | None) -> RuleConfigSummary | None:
+        if not config_path:
+            return None
+        try:
+            from .rules import load_rules
+            rules = load_rules(config_path)
+            rule_names = []
+            for pt in rules.project_types:
+                for att in pt.attachments:
+                    rule_names.append(att.name)
+            import hashlib
+            config_content = Path(config_path).read_text(encoding="utf-8")
+            config_hash = hashlib.sha256(config_content.encode("utf-8")).hexdigest()[:16]
+            return RuleConfigSummary(
+                project_type_count=len(rules.project_types),
+                rule_names=rule_names,
+                global_max_size_kb=rules.global_max_size_kb,
+                config_path=config_path,
+                config_hash=config_hash,
+            )
+        except Exception:
+            return None
+
+    def _get_undo_history_summary(self, batch_id: str) -> UndoHistorySummary:
+        with self._conn() as conn:
+            audit_rows = conn.execute(
+                "SELECT created_at, action FROM audit_log WHERE batch_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+                (batch_id,),
+            ).fetchall()
+            last_time = None
+            last_action = None
+            if audit_rows:
+                last_time = audit_rows[0]["created_at"]
+                last_action = audit_rows[0]["action"]
+
+            undo_count = conn.execute(
+                "SELECT COUNT(*) as cnt FROM undo_log WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()["cnt"]
+
+            return UndoHistorySummary(
+                total_undo_count=undo_count,
+                last_undo_time=last_time,
+                last_undo_action=last_action,
+            )
+
+    def _get_schemes_for_batch(self, batch_id: str) -> list[FilterScheme]:
+        schemes = self.list_schemes()
+        return [s for s in schemes if s.batch_id == batch_id]
+
+    def _make_work_package(
+        self,
+        batch: BatchInfo,
+        issues: list[IssueRecord],
+        rule_summary: RuleConfigSummary | None,
+        undo_summary: UndoHistorySummary,
+        schemes: list[FilterScheme],
+    ) -> dict[str, Any]:
+        issues_data = []
+        for i in issues:
+            issues_data.append({
+                "id": i.id,
+                "project_path": i.project_path,
+                "project_name": i.project_name,
+                "project_type_id": i.project_type_id,
+                "issue_type": i.issue_type,
+                "severity": i.severity,
+                "rule_name": i.rule_name,
+                "file_path": i.file_path,
+                "message": i.message,
+                "fingerprint": i.fingerprint,
+                "state": i.state,
+                "handler": i.handler,
+                "note": i.note,
+                "updated_at": i.updated_at,
+                "inherited_from_batch_id": i.inherited_from_batch_id,
+            })
+
+        return {
+            "package_version": 1,
+            "tool_version": PACKAGE_VERSION,
+            "exported_at": datetime.now().isoformat(timespec="seconds"),
+            "package_type": "work_package",
+            "batch": {
+                "batch_id": batch.batch_id,
+                "scan_path": batch.scan_path,
+                "scanned_at": batch.scanned_at,
+                "config_path": batch.config_path,
+                "issue_count": batch.issue_count,
+                "pending_count": batch.pending_count,
+                "passed_count": batch.passed_count,
+                "ignored_count": batch.ignored_count,
+            },
+            "issues": issues_data,
+            "rule_summary": rule_summary.to_dict() if rule_summary else None,
+            "undo_history": undo_summary.to_dict(),
+            "schemes": [s.to_migration_dict() for s in schemes],
+        }
+
+    def export_work_package(
+        self,
+        batch_id: str,
+    ) -> dict[str, Any]:
+        batch = self.get_batch(batch_id)
+        if batch is None:
+            raise BatchNotFoundError(batch_id)
+
+        issues = self.get_issues(batch_id)
+        rule_summary = self._compute_rule_summary(batch.config_path)
+        undo_summary = self._get_undo_history_summary(batch_id)
+        schemes = self._get_schemes_for_batch(batch_id)
+
+        return self._make_work_package(batch, issues, rule_summary, undo_summary, schemes)
+
+    def export_work_package_to_file(
+        self,
+        batch_id: str,
+        output_path: str | os.PathLike,
+    ) -> Path:
+        pkg = self.export_work_package(batch_id)
+        out = Path(output_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(pkg, ensure_ascii=False, indent=2), encoding="utf-8")
+        return out
+
+    @staticmethod
+    def _load_work_package(file_path: str | os.PathLike) -> dict[str, Any]:
+        fp = Path(file_path)
+        abs_path = str(fp.resolve())
+        raw = fp.read_text(encoding="utf-8")
+        if not raw.strip():
+            raise WorkPackageEmptyError(abs_path)
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise WorkPackageParseError(abs_path, f"JSON 格式错误: {e.msg} (行{e.lineno}, 列{e.colno})") from e
+        if not isinstance(data, dict):
+            raise InvalidWorkPackageError(f"文件 {abs_path} 顶层结构应为 JSON 对象，实际是 {type(data).__name__}")
+        if data.get("package_type") != "work_package":
+            raise InvalidWorkPackageError(f"文件 {abs_path} 不是有效的工作包（缺少 package_type=work_package）")
+
+        required_top = {"batch", "issues", "package_version"}
+        for fld in required_top:
+            if fld not in data:
+                raise WorkPackageMissingFieldError(abs_path, fld)
+
+        batch_required = {"batch_id", "scan_path", "scanned_at"}
+        for fld in batch_required:
+            if fld not in data["batch"]:
+                raise WorkPackageMissingFieldError(abs_path, fld, "batch")
+
+        if not isinstance(data["issues"], list):
+            raise InvalidWorkPackageError(f"文件 {abs_path} 的 'issues' 字段应为数组")
+        if not data["issues"]:
+            raise WorkPackageEmptyError(abs_path)
+
+        issue_required = {"project_path", "project_name", "issue_type", "severity", "message"}
+        for idx, issue in enumerate(data["issues"]):
+            if not isinstance(issue, dict):
+                raise InvalidWorkPackageError(f"文件 {abs_path} 第{idx + 1}个问题不是 JSON 对象")
+            for fld in issue_required:
+                if fld not in issue:
+                    raise WorkPackageMissingFieldError(abs_path, fld, f"issues[{idx}]")
+
+        if "schemes" in data and not isinstance(data["schemes"], list):
+            raise InvalidWorkPackageError(f"文件 {abs_path} 的 'schemes' 字段应为数组")
+
+        return data
+
+    def import_work_package(
+        self,
+        file_path: str | os.PathLike,
+        overwrite_batch: bool = False,
+        overwrite_state: bool = False,
+        overwrite_scheme: bool = False,
+        ignore_rule_mismatch: bool = False,
+        import_source_label: str | None = None,
+    ) -> dict[str, Any]:
+        fp = Path(file_path)
+        abs_path = str(fp.resolve())
+        source_label = import_source_label or f"import:{fp.name}"
+
+        pkg = self._load_work_package(abs_path)
+        batch_data = pkg["batch"]
+        batch_id = batch_data["batch_id"]
+        issues_data = pkg["issues"]
+        rule_summary_pkg = None
+        if pkg.get("rule_summary"):
+            rule_summary_pkg = RuleConfigSummary.from_dict(pkg["rule_summary"])
+        schemes_data = pkg.get("schemes", [])
+
+        result = {
+            "source_file": abs_path,
+            "package_version": pkg.get("package_version"),
+            "tool_version": pkg.get("tool_version"),
+            "exported_at": pkg.get("exported_at"),
+            "batch_id": batch_id,
+            "total_issues": len(issues_data),
+            "total_schemes": len(schemes_data),
+            "imported_issues": [],
+            "skipped_issues": [],
+            "conflict_issues": [],
+            "imported_schemes": [],
+            "skipped_schemes": [],
+            "warnings": [],
+        }
+
+        with self._tx() as conn:
+            existing_batch = conn.execute(
+                "SELECT * FROM batches WHERE batch_id = ?", (batch_id,)
+            ).fetchone()
+
+            if existing_batch and not overwrite_batch:
+                raise WorkPackageBatchExistsError(batch_id)
+
+            if rule_summary_pkg and existing_batch and "rule_summary_json" in existing_batch and existing_batch["rule_summary_json"]:
+                try:
+                    existing_rule_summary = RuleConfigSummary.from_dict(
+                        json.loads(existing_batch["rule_summary_json"])
+                    )
+                    diffs = rule_summary_pkg.compare(existing_rule_summary)
+                    if diffs and not ignore_rule_mismatch:
+                        raise WorkPackageRuleMismatchError(batch_id, "; ".join(diffs))
+                    if diffs:
+                        result["warnings"].append(f"规则摘要不一致: {'; '.join(diffs)}")
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+            local_rule_summary = None
+            if batch_data.get("config_path") and Path(batch_data["config_path"]).exists():
+                local_rule_summary = self._compute_rule_summary(batch_data["config_path"])
+                if rule_summary_pkg and local_rule_summary:
+                    diffs = rule_summary_pkg.compare(local_rule_summary)
+                    if diffs and not ignore_rule_mismatch:
+                        raise WorkPackageRuleMismatchError(batch_id, "; ".join(diffs))
+                    if diffs:
+                        result["warnings"].append(f"规则摘要与本地配置不一致: {'; '.join(diffs)}")
+
+            old_batch_import_source = None
+            old_batch_imported_at = None
+            old_issue_states = {}
+
+            if existing_batch and overwrite_batch:
+                old_batch_import_source = existing_batch["import_source"] if "import_source" in existing_batch else None
+                old_batch_imported_at = existing_batch["imported_at"] if "imported_at" in existing_batch else None
+                old_issues = conn.execute(
+                    "SELECT * FROM issues WHERE batch_id = ?",
+                    (batch_id,),
+                ).fetchall()
+                for oi in old_issues:
+                    old_issue_states[oi["id"]] = {
+                        "project_path": oi["project_path"],
+                        "project_name": oi["project_name"],
+                        "project_type_id": oi["project_type_id"],
+                        "issue_type": oi["issue_type"],
+                        "severity": oi["severity"],
+                        "rule_name": oi["rule_name"],
+                        "file_path": oi["file_path"],
+                        "message": oi["message"],
+                        "fingerprint": oi["fingerprint"],
+                        "state": oi["state"],
+                        "handler": oi["handler"],
+                        "note": oi["note"],
+                        "updated_at": oi["updated_at"],
+                        "inherited_from_batch_id": oi["inherited_from_batch_id"],
+                        "import_source": oi["import_source"] if "import_source" in oi else None,
+                    }
+                conn.execute("DELETE FROM issues WHERE batch_id = ?", (batch_id,))
+                conn.execute("DELETE FROM batches WHERE batch_id = ?", (batch_id,))
+
+            now = datetime.now().isoformat(timespec="seconds")
+            rule_summary_json = json.dumps(rule_summary_pkg.to_dict()) if rule_summary_pkg else None
+
+            conn.execute(
+                """INSERT INTO batches
+                (batch_id, scan_path, scanned_at, config_path, import_source, rule_summary_json, imported_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    batch_id,
+                    batch_data["scan_path"],
+                    batch_data["scanned_at"],
+                    batch_data.get("config_path"),
+                    source_label,
+                    rule_summary_json,
+                    now,
+                ),
+            )
+
+            new_issue_ids = []
+            for issue_data in issues_data:
+                fingerprint = issue_data.get("fingerprint")
+                existing_by_fp = None
+                if fingerprint:
+                    existing_by_fp = conn.execute(
+                        "SELECT * FROM issues WHERE batch_id = ? AND fingerprint = ?",
+                        (batch_id, fingerprint),
+                    ).fetchone()
+
+                if existing_by_fp and not overwrite_state:
+                    if existing_by_fp["state"] != issue_data.get("state", "pending"):
+                        result["conflict_issues"].append({
+                            "id": existing_by_fp["id"],
+                            "project_name": issue_data.get("project_name"),
+                            "rule_name": issue_data.get("rule_name"),
+                            "existing_state": existing_by_fp["state"],
+                            "import_state": issue_data.get("state", "pending"),
+                        })
+                    result["skipped_issues"].append({
+                        "fingerprint": fingerprint,
+                        "project_name": issue_data.get("project_name"),
+                        "rule_name": issue_data.get("rule_name"),
+                    })
+                    continue
+
+                state_val = issue_data.get("state", "pending")
+                if state_val not in VALID_STATES:
+                    state_val = "pending"
+
+                conn.execute(
+                    """INSERT INTO issues
+                    (batch_id, project_path, project_name, project_type_id,
+                     issue_type, severity, rule_name, file_path, message,
+                     fingerprint, state, handler, note, updated_at,
+                     inherited_from_batch_id, import_source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        batch_id,
+                        issue_data["project_path"],
+                        issue_data["project_name"],
+                        issue_data.get("project_type_id"),
+                        issue_data["issue_type"],
+                        issue_data["severity"],
+                        issue_data.get("rule_name"),
+                        issue_data.get("file_path"),
+                        issue_data["message"],
+                        fingerprint,
+                        state_val,
+                        issue_data.get("handler"),
+                        issue_data.get("note"),
+                        issue_data.get("updated_at") or now,
+                        issue_data.get("inherited_from_batch_id"),
+                        source_label,
+                    ),
+                )
+                new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                new_issue_ids.append(new_id)
+                result["imported_issues"].append({
+                    "new_id": new_id,
+                    "project_name": issue_data.get("project_name"),
+                    "rule_name": issue_data.get("rule_name"),
+                    "state": state_val,
+                })
+
+            old_schemes_json = None
+            imported_scheme_names = []
+            if schemes_data:
+                old_schemes_data = []
+                for s in schemes_data:
+                    name = s.get("name", "").strip()
+                    if not name:
+                        continue
+                    existing_scheme = conn.execute(
+                        "SELECT * FROM filter_schemes WHERE name = ?", (name,)
+                    ).fetchone()
+                    if existing_scheme and not overwrite_scheme:
+                        result["skipped_schemes"].append(name)
+                        continue
+                    if existing_scheme:
+                        old_schemes_data.append(dict(existing_scheme))
+                        conn.execute("DELETE FROM filter_schemes WHERE name = ?", (name,))
+
+                    try:
+                        state_val = s.get("state")
+                        if state_val is not None:
+                            state_val = _validate_state(state_val)
+                        severity_val = s.get("severity")
+                        if severity_val is not None and severity_val not in {"error", "warning"}:
+                            severity_val = None
+
+                        now_s = datetime.now().isoformat(timespec="seconds")
+                        created_at = s.get("created_at") or now_s
+                        updated_at = s.get("updated_at") or now_s
+                        version_val = int(s.get("version") or 1)
+
+                        conn.execute(
+                            """INSERT INTO filter_schemes
+                            (name, batch_id, state, severity, project_type_id, created_at, updated_at, version)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                name,
+                                batch_id,
+                                state_val,
+                                severity_val,
+                                s.get("project_type_id"),
+                                created_at,
+                                updated_at,
+                                version_val,
+                            ),
+                        )
+                        imported_scheme_names.append(name)
+                        result["imported_schemes"].append(name)
+                    except Exception as e:
+                        result["warnings"].append(f"方案 '{name}' 导入失败: {e}")
+
+                if old_schemes_data:
+                    old_schemes_json = json.dumps(old_schemes_data)
+
+            old_issue_states_json = json.dumps(old_issue_states) if old_issue_states else "{}"
+            conn.execute(
+                """INSERT INTO import_undo_log
+                (import_source, import_source_file, batch_id,
+                 old_batch_import_source, old_batch_imported_at,
+                 old_issue_states, old_schemes, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    source_label,
+                    abs_path,
+                    batch_id,
+                    old_batch_import_source,
+                    old_batch_imported_at,
+                    old_issue_states_json,
+                    old_schemes_json,
+                    now,
+                ),
+            )
+
+            conn.execute(
+                """INSERT INTO import_log
+                (import_source, import_source_file, batch_id,
+                 imported_issue_ids, imported_scheme_names, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    source_label,
+                    abs_path,
+                    batch_id,
+                    json.dumps(new_issue_ids),
+                    json.dumps(imported_scheme_names) if imported_scheme_names else None,
+                    now,
+                ),
+            )
+
+        return result
+
+    def get_import_undo_count(self, batch_id: str | None = None) -> int:
+        with self._conn() as conn:
+            if batch_id:
+                row = conn.execute(
+                    "SELECT COUNT(*) as cnt FROM import_undo_log WHERE batch_id = ?",
+                    (batch_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) as cnt FROM import_undo_log"
+                ).fetchone()
+            return row["cnt"] or 0
+
+    def undo_last_import(self, batch_id: str | None = None) -> ImportUndoRecord:
+        with self._tx() as conn:
+            if batch_id:
+                row = conn.execute(
+                    "SELECT * FROM import_undo_log WHERE batch_id = ? ORDER BY id DESC LIMIT 1",
+                    (batch_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM import_undo_log ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            if row is None:
+                raise EmptyWorkPackageUndoError()
+
+            undo_batch_id = row["batch_id"]
+            import_source = row["import_source"]
+            import_source_file = row["import_source_file"]
+
+            try:
+                old_issue_states = json.loads(row["old_issue_states"] or "{}")
+            except json.JSONDecodeError:
+                old_issue_states = {}
+
+            current_issues = conn.execute(
+                "SELECT id FROM issues WHERE batch_id = ?", (undo_batch_id,)
+            ).fetchall()
+            imported_issue_ids = [r["id"] for r in current_issues]
+
+            audit_issue_id = current_issues[0]["id"] if current_issues else 0
+
+            try:
+                imported_scheme_names = []
+                import_log_row = conn.execute(
+                    "SELECT imported_scheme_names FROM import_log WHERE batch_id = ? ORDER BY id DESC LIMIT 1",
+                    (undo_batch_id,),
+                ).fetchone()
+                if import_log_row and import_log_row["imported_scheme_names"]:
+                    imported_scheme_names = json.loads(import_log_row["imported_scheme_names"])
+            except (json.JSONDecodeError, KeyError):
+                imported_scheme_names = []
+
+            now = datetime.now().isoformat(timespec="seconds")
+            conn.execute(
+                """INSERT INTO audit_log
+                (batch_id, issue_id, action, old_state, old_handler, old_note,
+                 new_state, new_handler, new_note, created_at)
+                VALUES (?, ?, 'undo_import', ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    undo_batch_id,
+                    audit_issue_id,
+                    "", "", "", "", "", "",
+                    now,
+                ),
+            )
+
+            conn.execute("DELETE FROM filter_schemes WHERE batch_id = ?", (undo_batch_id,))
+            
+            if old_issue_states:
+                conn.execute("DELETE FROM issues WHERE batch_id = ?", (undo_batch_id,))
+                for old_id, old_data in old_issue_states.items():
+                    conn.execute(
+                        """INSERT INTO issues
+                        (id, batch_id, project_path, project_name, project_type_id,
+                         issue_type, severity, rule_name, file_path, message,
+                         fingerprint, state, handler, note, updated_at,
+                         inherited_from_batch_id, import_source)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            int(old_id),
+                            undo_batch_id,
+                            old_data["project_path"],
+                            old_data["project_name"],
+                            old_data["project_type_id"],
+                            old_data["issue_type"],
+                            old_data["severity"],
+                            old_data["rule_name"],
+                            old_data["file_path"],
+                            old_data["message"],
+                            old_data["fingerprint"],
+                            old_data["state"],
+                            old_data["handler"],
+                            old_data["note"],
+                            old_data["updated_at"],
+                            old_data["inherited_from_batch_id"],
+                            old_data.get("import_source"),
+                        ),
+                    )
+
+                conn.execute(
+                    "UPDATE batches SET import_source = ?, imported_at = ? WHERE batch_id = ?",
+                    (row["old_batch_import_source"], row["old_batch_imported_at"], undo_batch_id),
+                )
+            else:
+                conn.execute("DELETE FROM issues WHERE batch_id = ?", (undo_batch_id,))
+                conn.execute("DELETE FROM batches WHERE batch_id = ?", (undo_batch_id,))
+
+            if row["old_schemes"]:
+                try:
+                    old_schemes = json.loads(row["old_schemes"])
+                    for s in old_schemes:
+                        conn.execute(
+                            """INSERT OR REPLACE INTO filter_schemes
+                            (id, name, batch_id, state, severity, project_type_id, created_at, updated_at, version)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                s["id"], s["name"], s["batch_id"], s["state"],
+                                s["severity"], s["project_type_id"],
+                                s["created_at"], s["updated_at"], s["version"],
+                            ),
+                        )
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+            conn.execute("DELETE FROM import_undo_log WHERE id = ?", (row["id"],))
+
+            return ImportUndoRecord(
+                id=row["id"],
+                import_source=import_source,
+                import_source_file=import_source_file,
+                batch_id=undo_batch_id,
+                imported_issue_ids=imported_issue_ids,
+                imported_scheme_names=imported_scheme_names,
+                created_at=row["created_at"],
+            )
+
+    def get_import_log(self, batch_id: str | None = None) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM import_log"
+        params: list[Any] = []
+        if batch_id:
+            sql += " WHERE batch_id = ?"
+            params.append(batch_id)
+        sql += " ORDER BY created_at DESC, id DESC"
+        with self._conn() as conn:
+            rows = conn.execute(sql, params).fetchall()
+            result = []
+            for r in rows:
+                d = dict(r)
+                try:
+                    d["imported_issue_ids"] = json.loads(d["imported_issue_ids"] or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    d["imported_issue_ids"] = []
+                try:
+                    if d.get("imported_scheme_names"):
+                        d["imported_scheme_names"] = json.loads(d["imported_scheme_names"])
+                    else:
+                        d["imported_scheme_names"] = []
+                except (json.JSONDecodeError, TypeError):
+                    d["imported_scheme_names"] = []
+                result.append(d)
+            return result

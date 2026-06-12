@@ -17,6 +17,16 @@ from .exceptions import (
     BatchNotFoundError,
     NoPreviousBatchError,
     BatchPathMismatchWarning,
+    WorkPackageError,
+    InvalidWorkPackageError,
+    WorkPackageEmptyError,
+    WorkPackageParseError,
+    WorkPackageMissingFieldError,
+    WorkPackageBatchExistsError,
+    WorkPackageIssueStateConflictError,
+    WorkPackageRuleMismatchError,
+    WorkPackageSchemeExistsError,
+    EmptyWorkPackageUndoError,
 )
 from .exporter import export_csv, export_html, export_diff_csv, export_diff_html
 from .rules import load_rules
@@ -597,6 +607,139 @@ def cmd_scheme_audit(args: argparse.Namespace, storage: Storage) -> int:
     return 0
 
 
+def cmd_workpack_export(args: argparse.Namespace, storage: Storage) -> int:
+    out_path = Path(args.output)
+    if not out_path.suffix:
+        out_path = out_path.with_suffix(".json")
+    path = storage.export_work_package_to_file(args.batch, out_path)
+    pkg = storage.export_work_package(args.batch)
+    print(f"[OK] 工作包已导出: {path}")
+    print(f"  批次ID: {pkg['batch']['batch_id']}")
+    print(f"  问题数: {len(pkg['issues'])}")
+    print(f"  筛选方案数: {len(pkg['schemes'])}")
+    print(f"  导出时间: {pkg['exported_at']}")
+    print(f"  工作包格式版本: v{pkg['package_version']}")
+    if pkg.get("rule_summary"):
+        print(f"  规则摘要: {pkg['rule_summary']['project_type_count']} 种项目类型，"
+              f"{len(pkg['rule_summary']['rule_names'])} 条规则")
+    if pkg.get("undo_history") and pkg["undo_history"]["total_undo_count"]:
+        print(f"  撤销历史摘要: 共 {pkg['undo_history']['total_undo_count']} 次撤销操作")
+    if pkg["schemes"]:
+        print("  包含方案:")
+        for s in pkg["schemes"]:
+            print(f"    - {s['name']} (v{s['version']})")
+    return 0
+
+
+def _format_workpack_import_result(result: dict) -> str:
+    lines = [f"[OK] 工作包 {result['source_file']} 处理完成"]
+    lines.append(f"  批次ID: {result['batch_id']}")
+    lines.append(f"  导入来源标签: {result.get('import_source', 'import:' + Path(result['source_file']).name)}")
+    lines.append(f"  总计问题: {result['total_issues']} 个")
+    if result["imported_issues"]:
+        lines.append(f"  导入问题: {len(result['imported_issues'])} 个")
+    if result["skipped_issues"]:
+        lines.append(f"  跳过问题: {len(result['skipped_issues'])} 个（指纹已存在，未使用 --overwrite-state）")
+    if result["conflict_issues"]:
+        lines.append(f"  状态冲突: {len(result['conflict_issues'])} 个")
+        for c in result["conflict_issues"][:5]:
+            lines.append(
+                f"    - #{c['id']} {c.get('project_name', '')}: "
+                f"现有={c['existing_state']} vs 导入={c['import_state']}"
+            )
+        if len(result["conflict_issues"]) > 5:
+            lines.append(f"    ... 还有 {len(result['conflict_issues']) - 5} 个冲突")
+    if result["total_schemes"]:
+        lines.append(f"  总计方案: {result['total_schemes']} 个")
+    if result["imported_schemes"]:
+        lines.append(f"  导入方案: {len(result['imported_schemes'])} 个 - {', '.join(result['imported_schemes'])}")
+    if result["skipped_schemes"]:
+        lines.append(f"  跳过方案: {len(result['skipped_schemes'])} 个 - "
+                     f"{', '.join(result['skipped_schemes'])}（同名冲突，未使用 --overwrite-scheme）")
+    if result["warnings"]:
+        lines.append("  警告:")
+        for w in result["warnings"]:
+            lines.append(f"    - {w}")
+    return "\n".join(lines)
+
+
+def cmd_workpack_import(args: argparse.Namespace, storage: Storage) -> int:
+    try:
+        result = storage.import_work_package(
+            file_path=args.input,
+            overwrite_batch=args.overwrite_batch,
+            overwrite_state=args.overwrite_state,
+            overwrite_scheme=args.overwrite_scheme,
+            ignore_rule_mismatch=args.ignore_rule_mismatch,
+            import_source_label=args.source_label,
+        )
+    except WorkPackageError:
+        raise
+    except ContractArchiverError:
+        raise
+    except Exception as e:
+        print(f"[导入失败] {e}", file=sys.stderr)
+        return 3
+
+    result["import_source"] = args.source_label or f"import:{Path(args.input).name}"
+    print(_format_workpack_import_result(result))
+
+    has_errors = bool(result.get("conflict_issues"))
+    has_skips = bool(result.get("skipped_issues") or result.get("skipped_schemes"))
+    has_imports = bool(result.get("imported_issues") or result.get("imported_schemes"))
+
+    if has_errors and not has_imports:
+        return 3
+    if has_skips and not args.overwrite_state and not args.overwrite_scheme and not has_imports:
+        print("\n[提示] 上述内容因冲突被跳过，如需覆盖请加 --overwrite-state/--overwrite-scheme/--overwrite-batch",
+              file=sys.stderr)
+    return 0
+
+
+def cmd_workpack_undo(args: argparse.Namespace, storage: Storage) -> int:
+    if getattr(args, "count", False):
+        cnt = storage.get_import_undo_count(getattr(args, "batch", None))
+        print(f"可撤销导入操作数: {cnt}")
+        return 0
+    try:
+        undo = storage.undo_last_import(getattr(args, "batch", None))
+    except EmptyWorkPackageUndoError:
+        print("[撤销失败] 没有可撤销的工作包导入操作", file=sys.stderr)
+        return 1
+
+    print(f"[OK] 已撤销批次 {undo.batch_id} 的导入操作")
+    print(f"  导入来源: {undo.import_source}")
+    if undo.import_source_file:
+        print(f"  来源文件: {undo.import_source_file}")
+    print(f"  撤销问题数: {len(undo.imported_issue_ids)} 个")
+    if undo.imported_scheme_names:
+        print(f"  撤销方案数: {len(undo.imported_scheme_names)} 个 - {', '.join(undo.imported_scheme_names)}")
+    print(f"  原导入时间: {undo.created_at}")
+    remaining = storage.get_import_undo_count(undo.batch_id)
+    if remaining:
+        print(f"  剩余可撤销: {remaining} 条")
+    return 0
+
+
+def cmd_workpack_log(args: argparse.Namespace, storage: Storage) -> int:
+    logs = storage.get_import_log(getattr(args, "batch", None))
+    if not logs:
+        print("  (无工作包导入记录)")
+        return 0
+    print(f"{'时间':<20} {'来源标签':<25} {'批次ID':<26} {'问题数':>6} {'方案数':>6}  来源文件")
+    for lg in logs:
+        scheme_count = len(lg.get("imported_scheme_names", []))
+        print(
+            f"{lg['created_at']:<20} "
+            f"{lg['import_source']:<25} "
+            f"{lg['batch_id']:<26} "
+            f"{len(lg['imported_issue_ids']):>6} "
+            f"{scheme_count:>6}  "
+            f"{lg.get('import_source_file') or ''}"
+        )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="contract-archiver",
@@ -714,6 +857,36 @@ def build_parser() -> argparse.ArgumentParser:
     ps_audit.add_argument("name", nargs="?", default=None, help="仅查看指定方案名的日志（省略则查看全部）")
     ps_audit.set_defaults(func=cmd_scheme_audit)
 
+    p_workpack = sub.add_parser("workpack", help="工作包管理（导入导出批次、问题、方案）")
+    workpack_sub = p_workpack.add_subparsers(dest="workpack_action", required=True)
+
+    pw_exp = workpack_sub.add_parser("export", help="导出批次为工作包 JSON")
+    pw_exp.add_argument("-b", "--batch", required=True, help="要导出的批次ID")
+    pw_exp.add_argument("-o", "--output", required=True, help="输出 JSON 文件路径")
+    pw_exp.set_defaults(func=cmd_workpack_export)
+
+    pw_imp = workpack_sub.add_parser("import", help="从工作包 JSON 导入批次")
+    pw_imp.add_argument("input", help="工作包 JSON 文件路径")
+    pw_imp.add_argument("--source-label", help="自定义导入来源标签（默认: import:<文件名>）")
+    pw_imp.add_argument("--overwrite-batch", action="store_true",
+                        help="同名批次已存在时，覆盖整个批次及其问题（危险操作）")
+    pw_imp.add_argument("--overwrite-state", action="store_true",
+                        help="问题指纹匹配但状态不同时，覆盖状态和备注")
+    pw_imp.add_argument("--overwrite-scheme", action="store_true",
+                        help="筛选方案同名时覆盖（默认跳过）")
+    pw_imp.add_argument("--ignore-rule-mismatch", action="store_true",
+                        help="忽略规则摘要不一致的警告，强制导入")
+    pw_imp.set_defaults(func=cmd_workpack_import)
+
+    pw_undo = workpack_sub.add_parser("undo", help="撤销最近一次工作包导入操作")
+    pw_undo.add_argument("-b", "--batch", help="撤销指定批次的导入（省略则撤销最近一次）")
+    pw_undo.add_argument("--count", action="store_true", help="仅显示可撤销操作数量")
+    pw_undo.set_defaults(func=cmd_workpack_undo)
+
+    pw_log = workpack_sub.add_parser("log", help="查看工作包导入日志")
+    pw_log.add_argument("-b", "--batch", help="仅查看指定批次的导入日志（省略则查看全部）")
+    pw_log.set_defaults(func=cmd_workpack_log)
+
     return parser
 
 
@@ -740,6 +913,33 @@ def main(argv: list[str] | None = None) -> int:
     except SchemeImportConflictError as e:
         print(str(e), file=sys.stderr)
         return 8
+    except WorkPackageEmptyError as e:
+        print(str(e), file=sys.stderr)
+        return 14
+    except WorkPackageMissingFieldError as e:
+        print(str(e), file=sys.stderr)
+        return 15
+    except WorkPackageParseError as e:
+        print(str(e), file=sys.stderr)
+        return 16
+    except InvalidWorkPackageError as e:
+        print(str(e), file=sys.stderr)
+        return 17
+    except WorkPackageBatchExistsError as e:
+        print(str(e), file=sys.stderr)
+        return 18
+    except WorkPackageIssueStateConflictError as e:
+        print(str(e), file=sys.stderr)
+        return 19
+    except WorkPackageRuleMismatchError as e:
+        print(str(e), file=sys.stderr)
+        return 20
+    except WorkPackageSchemeExistsError as e:
+        print(str(e), file=sys.stderr)
+        return 21
+    except EmptyWorkPackageUndoError as e:
+        print(str(e), file=sys.stderr)
+        return 22
     except DatabasePermissionError as e:
         print(str(e), file=sys.stderr)
         return 9

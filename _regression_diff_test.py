@@ -203,6 +203,7 @@ def main():
             "当前状态", "处理人", "备注", "更新时间",
             "指纹",
             "继承来源批次",
+            "导入来源",
         ]
         for col in required_cols:
             assert col in header, f"CSV 表头缺少'{col}'"

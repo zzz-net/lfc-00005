@@ -117,9 +117,66 @@ python -m contract_archiver list -b 20260613010000_ab12cd34
 # 过滤：只看未处理的错误级问题
 python -m contract_archiver list -b 20260613010000_ab12cd34 \
   --state pending --severity error
+
+# 按项目类型过滤
+python -m contract_archiver list -b 20260613010000_ab12cd34 \
+  --project-type SALES
+
+# 使用已保存的筛选方案（方案含批次ID时可省略 -b）
+python -m contract_archiver list --scheme 法务-待补错误
 ```
 
-### 3. 标记问题状态
+### 3. 筛选方案管理
+
+法务经常反复输入相同的筛选条件，可以把"批次 + 状态 + 严重度 + 项目类型"的组合保存为命名方案，之后用方案名直接查看同一类问题。方案存入 SQLite，工具重启后仍可使用。
+
+```bash
+# 保存筛选方案（至少指定一个筛选条件：-b/--state/--severity/--project-type）
+python -m contract_archiver scheme save 法务-待补错误 \
+  -b 20260613010000_ab12cd34 --state pending --severity error
+
+# 保存跨批次方案（不绑定批次，使用时需额外指定 -b 或 --batch）
+python -m contract_archiver scheme save 采购类问题 \
+  --state pending --project-type PURCHASE
+
+# 覆盖同名方案（重名不加 --overwrite 会报错）
+python -m contract_archiver scheme save 法务-待补错误 \
+  --state passed --overwrite
+
+# 列出所有方案（按更新时间倒序）
+python -m contract_archiver scheme list
+
+# 查看方案详情（所有条件 + 创建/更新时间）
+python -m contract_archiver scheme show 法务-待补错误
+
+# 删除方案
+python -m contract_archiver scheme delete 采购类问题
+```
+
+**完整示例**：扫描示例数据 → 保存方案 → 套用方案查看 → 按方案导出
+
+```bash
+# 1. 扫描示例数据，拿到批次ID
+python -m contract_archiver scan -c examples/rules.yaml -d examples/sample_data
+# 输出：批次ID: 20260613010000_xxxxxxxx
+
+# 2. 保存一个常用筛选方案（把下面 <批次ID> 替换成上一步的输出）
+python -m contract_archiver scheme save 法务-待补错误 \
+  -b <批次ID> --state pending --severity error
+
+# 3. 套用方案查看问题（方案已带批次，无需再指定 -b）
+python -m contract_archiver list --scheme 法务-待补错误
+
+# 4. 按方案导出 CSV：报告首行标注方案名和条件，每行末尾附带方案列
+python -m contract_archiver export -o report.csv -f csv --scheme 法务-待补错误
+
+# 5. 按方案导出 HTML：报告头部有琥珀色方案卡片，元信息栏也标注方案名
+python -m contract_archiver export -o report.html -f html --scheme 法务-待补错误
+```
+
+**命令行参数与方案叠加规则**：`list`/`export` 可以同时使用 `--scheme` 和 `--state`/`--severity`/`--project-type`/`-b`，命令行参数优先，会补充或覆盖方案中的同名条件。
+
+### 4. 标记问题状态
 
 ```bash
 # 标记单个问题为"通过"，填写处理人+备注
@@ -193,6 +250,7 @@ python -m contract_archiver export -b <批次ID> -o report.csv -f csv
 python -m contract_archiver --help
 python -m contract_archiver scan --help
 python -m contract_archiver list --help
+python -m contract_archiver scheme --help
 python -m contract_archiver mark --help
 python -m contract_archiver undo --help
 python -m contract_archiver export --help

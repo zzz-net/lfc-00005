@@ -10,7 +10,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
-from .exceptions import DuplicateBatchError, EmptyUndoError, InvalidStateError
+from .exceptions import (
+    DuplicateBatchError,
+    EmptyUndoError,
+    InvalidStateError,
+    SchemeNotFoundError,
+    SchemeExistsError,
+    EmptySchemeError,
+    DatabasePermissionError,
+)
 from .scanner import IssueSeverity, IssueType, ScanIssue, ScanResult, ProjectScanResult
 
 
@@ -83,6 +91,34 @@ class UndoRecord:
     created_at: str
 
 
+@dataclass
+class FilterScheme:
+    id: int
+    name: str
+    batch_id: str | None
+    state: str | None
+    severity: str | None
+    project_type_id: str | None
+    created_at: str
+    updated_at: str
+
+    @property
+    def is_empty(self) -> bool:
+        return all(v is None for v in (self.batch_id, self.state, self.severity, self.project_type_id))
+
+    def to_display_dict(self) -> dict[str, str]:
+        labels: dict[str, str] = {}
+        if self.batch_id:
+            labels["批次"] = self.batch_id
+        if self.state:
+            labels["状态"] = STATE_LABELS.get(self.state, self.state)
+        if self.severity:
+            labels["严重度"] = "错误" if self.severity == "error" else "警告"
+        if self.project_type_id:
+            labels["项目类型"] = self.project_type_id
+        return labels
+
+
 class Storage:
     def __init__(self, db_path: str | os.PathLike = None):
         if db_path is None:
@@ -91,7 +127,12 @@ class Storage:
         self._init_db()
 
     def _conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path))
+        try:
+            conn = sqlite3.connect(str(self.db_path))
+        except sqlite3.OperationalError as e:
+            if "permission" in str(e).lower() or "unable to open" in str(e).lower():
+                raise DatabasePermissionError(str(self.db_path), "连接") from e
+            raise
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
@@ -101,7 +142,12 @@ class Storage:
         conn = self._conn()
         try:
             yield conn
-            conn.commit()
+            try:
+                conn.commit()
+            except sqlite3.OperationalError as e:
+                if "readonly" in str(e).lower() or "permission" in str(e).lower():
+                    raise DatabasePermissionError(str(self.db_path), "写入") from e
+                raise
         except Exception:
             conn.rollback()
             raise
@@ -170,6 +216,17 @@ class Storage:
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_audit_batch ON audit_log(batch_id);
+
+                CREATE TABLE IF NOT EXISTS filter_schemes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    batch_id TEXT,
+                    state TEXT,
+                    severity TEXT,
+                    project_type_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
             try:
@@ -331,6 +388,7 @@ class Storage:
         batch_id: str,
         state: str | None = None,
         severity: str | None = None,
+        project_type_id: str | None = None,
     ) -> list[IssueRecord]:
         sql = "SELECT * FROM issues WHERE batch_id = ?"
         params: list[Any] = [batch_id]
@@ -340,6 +398,9 @@ class Storage:
         if severity:
             sql += " AND severity = ?"
             params.append(severity)
+        if project_type_id:
+            sql += " AND project_type_id = ?"
+            params.append(project_type_id)
         sql += " ORDER BY project_name, id"
 
         with self._conn() as conn:
@@ -512,3 +573,117 @@ class Storage:
                 (batch_id,),
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def save_scheme(
+        self,
+        name: str,
+        batch_id: str | None = None,
+        state: str | None = None,
+        severity: str | None = None,
+        project_type_id: str | None = None,
+        overwrite: bool = False,
+    ) -> FilterScheme:
+        name = name.strip()
+        if not name:
+            raise ValueError("方案名称不能为空")
+
+        has_any = any(v is not None for v in (batch_id, state, severity, project_type_id))
+        if not has_any:
+            raise EmptySchemeError(name)
+
+        if state is not None:
+            state = _validate_state(state)
+
+        now = datetime.now().isoformat(timespec="seconds")
+
+        with self._tx() as conn:
+            existing = conn.execute(
+                "SELECT * FROM filter_schemes WHERE name = ?",
+                (name,),
+            ).fetchone()
+
+            if existing and not overwrite:
+                raise SchemeExistsError(name)
+
+            if existing:
+                conn.execute(
+                    """UPDATE filter_schemes
+                    SET batch_id=?, state=?, severity=?, project_type_id=?, updated_at=?
+                    WHERE name=?""",
+                    (batch_id, state, severity, project_type_id, now, name),
+                )
+            else:
+                try:
+                    conn.execute(
+                        """INSERT INTO filter_schemes
+                        (name, batch_id, state, severity, project_type_id, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (name, batch_id, state, severity, project_type_id, now, now),
+                    )
+                except sqlite3.IntegrityError as e:
+                    if "UNIQUE" in str(e):
+                        raise SchemeExistsError(name) from e
+                    raise
+
+            row = conn.execute(
+                "SELECT * FROM filter_schemes WHERE name = ?",
+                (name,),
+            ).fetchone()
+            return FilterScheme(
+                id=row["id"],
+                name=row["name"],
+                batch_id=row["batch_id"],
+                state=row["state"],
+                severity=row["severity"],
+                project_type_id=row["project_type_id"],
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+            )
+
+    def list_schemes(self) -> list[FilterScheme]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM filter_schemes ORDER BY updated_at DESC, name ASC"
+            ).fetchall()
+            return [
+                FilterScheme(
+                    id=r["id"],
+                    name=r["name"],
+                    batch_id=r["batch_id"],
+                    state=r["state"],
+                    severity=r["severity"],
+                    project_type_id=r["project_type_id"],
+                    created_at=r["created_at"],
+                    updated_at=r["updated_at"],
+                )
+                for r in rows
+            ]
+
+    def get_scheme(self, name: str) -> FilterScheme:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM filter_schemes WHERE name = ?",
+                (name,),
+            ).fetchone()
+            if row is None:
+                raise SchemeNotFoundError(name)
+            return FilterScheme(
+                id=row["id"],
+                name=row["name"],
+                batch_id=row["batch_id"],
+                state=row["state"],
+                severity=row["severity"],
+                project_type_id=row["project_type_id"],
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+            )
+
+    def delete_scheme(self, name: str) -> None:
+        with self._tx() as conn:
+            existing = conn.execute(
+                "SELECT id FROM filter_schemes WHERE name = ?",
+                (name,),
+            ).fetchone()
+            if existing is None:
+                raise SchemeNotFoundError(name)
+            conn.execute("DELETE FROM filter_schemes WHERE name = ?", (name,))

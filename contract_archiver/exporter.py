@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from .storage import BatchInfo, IssueRecord, STATE_LABELS
+from .storage import BatchInfo, IssueRecord, STATE_LABELS, FilterScheme
 
 
 STATE_CLASS = {
@@ -32,18 +32,32 @@ def export_csv(
     issues: Iterable[IssueRecord],
     output_path: str | os.PathLike,
     audit_log: Sequence[dict] | None = None,
+    filter_scheme: FilterScheme | None = None,
 ) -> Path:
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
 
+    scheme_name = filter_scheme.name if filter_scheme else ""
+    scheme_conditions = ""
+    if filter_scheme:
+        d = filter_scheme.to_display_dict()
+        scheme_conditions = " + ".join(f"{k}={v}" for k, v in d.items())
+
     with open(out, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f)
+        if filter_scheme:
+            writer.writerow([
+                "筛选方案", scheme_name,
+                "筛选条件", scheme_conditions,
+            ])
+            writer.writerow([])
         writer.writerow([
             "批次ID", "扫描路径", "扫描时间",
             "项目名称", "项目类型",
             "问题ID", "问题类型", "严重程度",
             "规则名", "文件路径",
             "问题描述", "状态", "处理人", "备注", "更新时间",
+            "筛选方案", "方案条件",
         ])
         for issue in issues:
             writer.writerow([
@@ -62,6 +76,8 @@ def export_csv(
                 issue.handler or "",
                 issue.note or "",
                 issue.updated_at or "",
+                scheme_name,
+                scheme_conditions,
             ])
 
     if audit_log:
@@ -100,6 +116,7 @@ def export_html(
     issues: list[IssueRecord],
     output_path: str | os.PathLike,
     audit_log: Sequence[dict] | None = None,
+    filter_scheme: FilterScheme | None = None,
 ) -> Path:
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -116,6 +133,22 @@ def export_html(
     warnings = sum(1 for i in issues if i.severity == "warning")
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    scheme_html = ""
+    scheme_meta_html = ""
+    if filter_scheme:
+        d = filter_scheme.to_display_dict()
+        cond_parts = [f"<strong>{html.escape(k)}</strong>: {html.escape(v)}" for k, v in d.items()]
+        cond_html = " &nbsp;|&nbsp; ".join(cond_parts) if cond_parts else "(无具体条件)"
+        scheme_html = f"""
+<div class="scheme-info" style="margin-bottom:24px;padding:16px;background:#fff8e1;border:1px solid #ffe082;border-radius:6px;">
+  <div style="font-size:13px;color:#e65100;font-weight:bold;margin-bottom:8px;">📌 使用筛选方案导出</div>
+  <div><strong>方案名:</strong> <span style="font-size:18px;color:#e65100;">「{html.escape(filter_scheme.name)}」</span></div>
+  <div style="margin-top:6px;">{cond_html}</div>
+  <div style="margin-top:6px;font-size:12px;color:#888;">方案创建时间: {html.escape(filter_scheme.created_at)} &nbsp;|&nbsp; 最近更新: {html.escape(filter_scheme.updated_at)}</div>
+</div>
+"""
+        scheme_meta_html = f" &nbsp;|&nbsp; 筛选方案: <code style='background:#fff8e1;color:#e65100;'>{html.escape(filter_scheme.name)}</code>"
 
     rows_html = []
     for project_name in sorted(grouped.keys()):
@@ -231,8 +264,10 @@ td.message {{ max-width: 400px; }}
 <div class="meta">
 批次 ID: <strong>{html.escape(batch.batch_id)}</strong> &nbsp;|&nbsp;
 扫描路径: <code>{html.escape(batch.scan_path)}</code> &nbsp;|&nbsp;
-扫描时间: {html.escape(batch.scanned_at)}
+扫描时间: {html.escape(batch.scanned_at)}{scheme_meta_html}
 </div>
+
+{scheme_html}
 
 <h2>问题汇总</h2>
 <div class="summary">

@@ -178,8 +178,11 @@ python -m contract_archiver export -b <批次ID> -o report.csv -f csv
 默认在当前目录生成 `contract_archive.db`（SQLite），可通过 `--db` 参数指定路径。包含以下表：
 
 - `batches`：扫描批次元信息
-- `issues`：问题明细及状态/处理人/备注
-- `undo_log`：撤销日志（逐条回滚）
+- `issues`：问题明细及状态/处理人/备注/稳定指纹
+- `undo_log`：撤销日志（逐条回滚用，执行撤销后删除）
+- `audit_log`：**永久审计日志**（所有状态变更和撤销操作，永不删除）
+
+数据库支持自动迁移：旧版本数据库会自动添加 `fingerprint` 列和 `audit_log` 表，无需手动升级。
 
 删除数据库文件即清空所有历史，数据库文件可直接归档保留。
 

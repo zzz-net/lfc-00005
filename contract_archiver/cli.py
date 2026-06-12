@@ -10,7 +10,7 @@ from .exceptions import ContractArchiverError
 from .exporter import export_csv, export_html
 from .rules import load_rules
 from .scanner import scan_directory
-from .storage import STATE_LABELS, Storage
+from .storage import STATE_LABELS, Storage, FilterScheme
 
 
 def _ensure_utf8_stdio() -> None:
@@ -74,14 +74,55 @@ def cmd_scan(args: argparse.Namespace, storage: Storage) -> int:
 
 
 def cmd_list(args: argparse.Namespace, storage: Storage) -> int:
-    if args.batch:
-        issues = storage.get_issues(args.batch, state=args.state, severity=args.severity)
+    if args.batch or args.scheme:
+        scheme: FilterScheme | None = None
+        scheme_batch_id: str | None = None
+        state_filter: str | None = args.state
+        severity_filter: str | None = args.severity
+        project_type_filter: str | None = args.project_type
+
+        if args.scheme:
+            scheme = storage.get_scheme(args.scheme)
+            state_filter = scheme.state if scheme.state is not None else state_filter
+            severity_filter = scheme.severity if scheme.severity is not None else severity_filter
+            project_type_filter = scheme.project_type_id if scheme.project_type_id is not None else project_type_filter
+            if scheme.batch_id:
+                scheme_batch_id = scheme.batch_id
+
+        use_batch = args.batch or scheme_batch_id
+        if use_batch is None:
+            print("[错误] 请通过 -b/--batch 指定批次，或使用包含批次条件的方案")
+            return 2
+
+        issues = storage.get_issues(
+            use_batch,
+            state=state_filter,
+            severity=severity_filter,
+            project_type_id=project_type_filter,
+        )
+
         if not issues:
-            if args.format == "json":
-                print("[]")
+            if scheme:
+                cond_str = " + ".join(f"{k}={v}" for k, v in scheme.to_display_dict().items())
+                print(f"  (无匹配问题，方案「{scheme.name}」条件: {cond_str})")
             else:
-                print("  (无问题记录)")
+                filter_hints = []
+                if state_filter:
+                    filter_hints.append(f"状态={STATE_LABELS.get(state_filter, state_filter)}")
+                if severity_filter:
+                    filter_hints.append(f"严重度={'错误' if severity_filter == 'error' else '警告'}")
+                if project_type_filter:
+                    filter_hints.append(f"项目类型={project_type_filter}")
+                hint = f"（当前筛选: {' + '.join(filter_hints)}）" if filter_hints else ""
+                if args.format == "json":
+                    print("[]")
+                else:
+                    print(f"  (无问题记录{hint})")
             return 0
+
+        if scheme:
+            cond_str = " + ".join(f"{k}={v}" for k, v in scheme.to_display_dict().items())
+            print(f"[使用筛选方案「{scheme.name}」: {cond_str}]")
 
         if args.format == "json":
             import json
@@ -197,28 +238,109 @@ def cmd_undo(args: argparse.Namespace, storage: Storage) -> int:
 
 def cmd_export(args: argparse.Namespace, storage: Storage) -> int:
     batch_list = storage.list_batches()
-    batch = next((b for b in batch_list if b.batch_id == args.batch), None)
-    if batch is None:
-        print(f"[错误] 批次 {args.batch} 不存在")
+
+    scheme: FilterScheme | None = None
+    scheme_batch_id: str | None = None
+    state_filter: str | None = args.state
+    severity_filter: str | None = args.severity
+    project_type_filter: str | None = args.project_type
+
+    if args.scheme:
+        scheme = storage.get_scheme(args.scheme)
+        state_filter = scheme.state if scheme.state is not None else state_filter
+        severity_filter = scheme.severity if scheme.severity is not None else severity_filter
+        project_type_filter = scheme.project_type_id if scheme.project_type_id is not None else project_type_filter
+        if scheme.batch_id:
+            scheme_batch_id = scheme.batch_id
+
+    use_batch = args.batch or scheme_batch_id
+    if use_batch is None:
+        print("[错误] 请通过 -b/--batch 指定批次，或使用包含批次条件的方案")
         return 2
 
-    issues = storage.get_issues(args.batch)
-    audit_log = storage.get_audit_log(args.batch)
+    batch = next((b for b in batch_list if b.batch_id == use_batch), None)
+    if batch is None:
+        print(f"[错误] 批次 {use_batch} 不存在")
+        return 2
+
+    issues = storage.get_issues(
+        use_batch,
+        state=state_filter,
+        severity=severity_filter,
+        project_type_id=project_type_filter,
+    )
+    audit_log = storage.get_audit_log(use_batch)
     out_path = Path(args.output)
 
     if args.format == "csv":
         if not out_path.suffix:
             out_path = out_path.with_suffix(".csv")
-        path = export_csv(batch, issues, out_path, audit_log=audit_log)
+        path = export_csv(batch, issues, out_path, audit_log=audit_log, filter_scheme=scheme)
         if audit_log:
             audit_path = out_path.with_name(out_path.stem + "_audit" + out_path.suffix)
             print(f"      审计轨迹: {audit_path}")
     else:
         if not out_path.suffix:
             out_path = out_path.with_suffix(".html")
-        path = export_html(batch, issues, out_path, audit_log=audit_log)
+        path = export_html(batch, issues, out_path, audit_log=audit_log, filter_scheme=scheme)
 
     print(f"[OK] 报告已导出: {path}")
+    if scheme:
+        cond_str = " + ".join(f"{k}={v}" for k, v in scheme.to_display_dict().items())
+        print(f"      使用方案「{scheme.name}」: {cond_str}")
+    return 0
+
+
+def _format_scheme_conditions(scheme: FilterScheme) -> str:
+    d = scheme.to_display_dict()
+    if not d:
+        return "(空方案)"
+    return "  ".join(f"{k}={v}" for k, v in d.items())
+
+
+def cmd_scheme_list(args: argparse.Namespace, storage: Storage) -> int:
+    schemes = storage.list_schemes()
+    if not schemes:
+        print("  (无筛选方案)")
+        return 0
+    print(f"{'方案名':<20} {'更新时间':<20}  筛选条件")
+    for s in schemes:
+        print(f"{s.name:<20} {s.updated_at:<20}  {_format_scheme_conditions(s)}")
+    return 0
+
+
+def cmd_scheme_show(args: argparse.Namespace, storage: Storage) -> int:
+    scheme = storage.get_scheme(args.name)
+    print(f"方案名: {scheme.name}")
+    print(f"创建时间: {scheme.created_at}")
+    print(f"更新时间: {scheme.updated_at}")
+    print("筛选条件:")
+    d = scheme.to_display_dict()
+    if not d:
+        print("  (无)")
+    for k, v in d.items():
+        print(f"  {k}: {v}")
+    return 0
+
+
+def cmd_scheme_save(args: argparse.Namespace, storage: Storage) -> int:
+    scheme = storage.save_scheme(
+        name=args.name,
+        batch_id=args.batch,
+        state=args.state,
+        severity=args.severity,
+        project_type_id=args.project_type,
+        overwrite=args.overwrite,
+    )
+    action = "覆盖更新" if args.overwrite else "创建"
+    print(f"[OK] 已{action}方案「{scheme.name}」")
+    print(f"  筛选条件: {_format_scheme_conditions(scheme)}")
+    return 0
+
+
+def cmd_scheme_delete(args: argparse.Namespace, storage: Storage) -> int:
+    storage.delete_scheme(args.name)
+    print(f"[OK] 已删除筛选方案「{args.name}」")
     return 0
 
 
@@ -244,6 +366,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_list.add_argument("-d", "--directory", help="按扫描路径过滤批次")
     p_list.add_argument("--state", choices=["pending", "passed", "ignored"], help="按状态过滤问题")
     p_list.add_argument("--severity", choices=["error", "warning"], help="按严重度过滤问题")
+    p_list.add_argument("--project-type", dest="project_type", help="按项目类型ID过滤问题")
+    p_list.add_argument("--scheme", help="使用已保存的筛选方案过滤问题")
     p_list.add_argument("--format", choices=["table", "json"], default="table", help="输出格式 (默认: table)")
     p_list.set_defaults(func=cmd_list)
 
@@ -264,13 +388,40 @@ def build_parser() -> argparse.ArgumentParser:
     p_undo.set_defaults(func=cmd_undo)
 
     p_exp = sub.add_parser("export", help="导出报告")
-    p_exp.add_argument("-b", "--batch", required=True, help="批次ID")
+    p_exp.add_argument("-b", "--batch", help="批次ID（如方案已指定批次可省略）")
     p_exp.add_argument("-o", "--output", required=True, help="输出文件路径")
     p_exp.add_argument(
         "-f", "--format", choices=["csv", "html"], default="html",
         help="导出格式 (默认: html)",
     )
+    p_exp.add_argument("--state", choices=["pending", "passed", "ignored"], help="按状态过滤问题")
+    p_exp.add_argument("--severity", choices=["error", "warning"], help="按严重度过滤问题")
+    p_exp.add_argument("--project-type", dest="project_type", help="按项目类型ID过滤问题")
+    p_exp.add_argument("--scheme", help="使用已保存的筛选方案过滤问题")
     p_exp.set_defaults(func=cmd_export)
+
+    p_scheme = sub.add_parser("scheme", help="筛选方案管理")
+    scheme_sub = p_scheme.add_subparsers(dest="scheme_action", required=True)
+
+    ps_list = scheme_sub.add_parser("list", help="列出所有筛选方案")
+    ps_list.set_defaults(func=cmd_scheme_list)
+
+    ps_show = scheme_sub.add_parser("show", help="查看筛选方案详情")
+    ps_show.add_argument("name", help="方案名称")
+    ps_show.set_defaults(func=cmd_scheme_show)
+
+    ps_save = scheme_sub.add_parser("save", help="保存筛选方案")
+    ps_save.add_argument("name", help="方案名称")
+    ps_save.add_argument("-b", "--batch", help="批次ID条件")
+    ps_save.add_argument("--state", choices=["pending", "passed", "ignored"], help="状态条件")
+    ps_save.add_argument("--severity", choices=["error", "warning"], help="严重度条件")
+    ps_save.add_argument("--project-type", dest="project_type", help="项目类型ID条件")
+    ps_save.add_argument("--overwrite", action="store_true", help="若同名方案已存在则覆盖")
+    ps_save.set_defaults(func=cmd_scheme_save)
+
+    ps_del = scheme_sub.add_parser("delete", help="删除筛选方案")
+    ps_del.add_argument("name", help="方案名称")
+    ps_del.set_defaults(func=cmd_scheme_delete)
 
     return parser
 

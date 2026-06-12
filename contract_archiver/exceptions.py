@@ -31,3 +31,29 @@ class DuplicateBatchError(ContractArchiverError):
 class InvalidStateError(ContractArchiverError):
     def __init__(self, state):
         super().__init__(f"[状态无效] 不支持的标记状态: {state}")
+
+
+class SchemeNotFoundError(ContractArchiverError):
+    def __init__(self, name: str):
+        super().__init__(f"[方案不存在] 未找到筛选方案: {name}")
+
+
+class SchemeExistsError(ContractArchiverError):
+    def __init__(self, name: str):
+        super().__init__(
+            f"[方案已存在] 筛选方案 '{name}' 已存在，使用 --overwrite 可覆盖"
+        )
+
+
+class EmptySchemeError(ContractArchiverError):
+    def __init__(self, name: str):
+        super().__init__(
+            f"[空方案] 筛选方案 '{name}' 未指定任何筛选条件，至少需要一个条件"
+        )
+
+
+class DatabasePermissionError(ContractArchiverError):
+    def __init__(self, db_path: str, operation: str):
+        super().__init__(
+            f"[数据库权限错误] 无法对数据库 {db_path} 执行 {operation} 操作，请检查文件权限"
+        )

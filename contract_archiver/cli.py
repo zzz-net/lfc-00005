@@ -27,11 +27,24 @@ from .exceptions import (
     WorkPackageRuleMismatchError,
     WorkPackageSchemeExistsError,
     EmptyWorkPackageUndoError,
+    LedgerError,
+    LedgerNotFoundError,
+    LedgerExistsError,
+    LedgerRecordExistsError,
+    LedgerConfigError,
+    EmptyLedgerUndoError,
+    LedgerImportConflictError,
+    LedgerResponsibleMismatchError,
+    LedgerPackageError,
+    LedgerPackageEmptyError,
+    LedgerPackageParseError,
+    LedgerPackageMissingFieldError,
+    InvalidLedgerPackageError,
 )
 from .exporter import export_csv, export_html, export_diff_csv, export_diff_html
 from .rules import load_rules
 from .scanner import scan_directory
-from .storage import STATE_LABELS, Storage, FilterScheme, DIFF_TYPE_LABELS
+from .storage import STATE_LABELS, Storage, FilterScheme, DIFF_TYPE_LABELS, LEDGER_PROGRESS_LABELS, LEDGER_PRIORITY_LABELS
 
 
 def _ensure_utf8_stdio() -> None:
@@ -740,6 +753,239 @@ def cmd_workpack_log(args: argparse.Namespace, storage: Storage) -> int:
     return 0
 
 
+def cmd_ledger_create(args: argparse.Namespace, storage: Storage) -> int:
+    ledger_info, records, action = storage.create_ledger(
+        name=args.name,
+        batch_id=args.batch,
+        state=getattr(args, "state", None),
+        severity=getattr(args, "severity", None),
+        project_type_id=getattr(args, "project_type", None),
+        scheme_name=getattr(args, "scheme", None),
+        responsible_person=getattr(args, "responsible", None),
+        deadline_days=getattr(args, "deadline_days", None),
+        overwrite=getattr(args, "overwrite", False),
+    )
+    action_label = "覆盖更新" if action == "overwrite" else "创建"
+    print(f"[OK] 已{action_label}台账「{ledger_info.name}」")
+    print(f"  批次: {ledger_info.batch_id}")
+    print(f"  待办记录: {ledger_info.record_count} 条")
+    print(f"  待处理: {ledger_info.pending_count} | 跟进中: {ledger_info.in_progress_count} | 逾期: {ledger_info.overdue_count}")
+    return 0
+
+
+def cmd_ledger_list(args: argparse.Namespace, storage: Storage) -> int:
+    if getattr(args, "name", None):
+        ledger = storage.get_ledger(args.name)
+        if ledger is None:
+            raise LedgerNotFoundError(args.name)
+        records = storage.get_ledger_records(
+            args.name,
+            responsible_person=getattr(args, "responsible", None),
+            overdue=getattr(args, "overdue", False),
+            project_type_id=getattr(args, "project_type", None),
+            progress=getattr(args, "progress", None),
+        )
+        if not records:
+            print(f"  (台账「{args.name}」无匹配待办记录)")
+            return 0
+        print(f"台账「{ledger.name}」- 共 {len(records)} 条记录")
+        print(f"{'ID':>5} {'优先级':<4} {'进度':<6} {'负责人':<10} {'截止日期':<20} {'项目':<20} {'规则/文件':<30} 备注")
+        for r in records:
+            target = r.rule_name or r.file_path or "-"
+            notes = (r.communication_notes or "")[:30] + ("..." if r.communication_notes and len(r.communication_notes) > 30 else "")
+            overdue_mark = " ⚠逾期" if r.is_overdue else ""
+            print(
+                f"{r.id:>5} {r.priority_label:<4} {r.progress_label:<6} "
+                f"{r.responsible_person or '':<10} {r.deadline or '':<20} "
+                f"{r.project_name[:20]:<20} {target[:30]:<30} {notes}{overdue_mark}"
+            )
+    else:
+        ledgers = storage.list_ledgers()
+        if not ledgers:
+            print("  (无台账)")
+            return 0
+        print(f"{'台账名':<20} {'批次ID':<26} {'记录':>4} {'待处理':>4} {'跟进中':>4} {'逾期':>4} {'更新时间':<20}")
+        for l in ledgers:
+            print(
+                f"{l.name:<20} {l.batch_id:<26} {l.record_count:>4} "
+                f"{l.pending_count:>4} {l.in_progress_count:>4} {l.overdue_count:>4} "
+                f"{l.updated_at:<20}"
+            )
+    return 0
+
+
+def cmd_ledger_update(args: argparse.Namespace, storage: Storage) -> int:
+    rec = storage.update_ledger_record(
+        ledger_name=args.ledger,
+        record_id=args.id,
+        responsible_person=getattr(args, "responsible", None),
+        deadline=getattr(args, "deadline", None),
+        priority=getattr(args, "priority", None),
+        communication_notes=getattr(args, "notes", None),
+        progress=getattr(args, "progress", None),
+    )
+    print(f"[OK] 已更新台账「{rec.ledger_name}」记录 #{rec.id}")
+    print(f"  项目: {rec.project_name}")
+    if rec.responsible_person:
+        print(f"  负责人: {rec.responsible_person}")
+    if rec.deadline:
+        print(f"  截止日期: {rec.deadline}")
+    print(f"  优先级: {rec.priority_label}")
+    print(f"  进度: {rec.progress_label}")
+    if rec.communication_notes:
+        print(f"  备注: {rec.communication_notes}")
+    return 0
+
+
+def cmd_ledger_delete(args: argparse.Namespace, storage: Storage) -> int:
+    storage.delete_ledger(args.name)
+    print(f"[OK] 已删除台账「{args.name}」")
+    return 0
+
+
+def cmd_ledger_config_get(args: argparse.Namespace, storage: Storage) -> int:
+    cfg = storage.get_ledger_config(args.key)
+    if cfg is None:
+        print(f"  (配置项 '{args.key}' 未设置)")
+        return 0
+    print(f"{cfg.key} = {cfg.value}")
+    print(f"  更新时间: {cfg.updated_at}")
+    return 0
+
+
+def cmd_ledger_config_set(args: argparse.Namespace, storage: Storage) -> int:
+    try:
+        cfg = storage.set_ledger_config(args.key, args.value)
+        print(f"[OK] 已设置配置项 '{cfg.key}'")
+        print(f"  值: {cfg.value}")
+        print(f"  更新时间: {cfg.updated_at}")
+    except LedgerConfigError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    return 0
+
+
+def cmd_ledger_config_list(args: argparse.Namespace, storage: Storage) -> int:
+    configs = storage.list_ledger_config()
+    if not configs:
+        print("  (无台账配置)")
+        return 0
+    print(f"{'配置键':<25} {'值':<50} {'更新时间':<20}")
+    for c in configs:
+        val = c.value[:47] + "..." if len(c.value) > 50 else c.value
+        print(f"{c.key:<25} {val:<50} {c.updated_at:<20}")
+    return 0
+
+
+def cmd_ledger_export(args: argparse.Namespace, storage: Storage) -> int:
+    from .exporter import export_ledger_csv, export_ledger_html
+    ledger = storage.get_ledger(args.name)
+    if ledger is None:
+        raise LedgerNotFoundError(args.name)
+    records = storage.get_ledger_records(args.name)
+    out_path = Path(args.output)
+
+    if args.format == "csv":
+        if not out_path.suffix:
+            out_path = out_path.with_suffix(".csv")
+        path = export_ledger_csv(ledger, records, out_path)
+    else:
+        if not out_path.suffix:
+            out_path = out_path.with_suffix(".html")
+        path = export_ledger_html(ledger, records, out_path)
+    print(f"[OK] 台账已导出: {path}")
+    return 0
+
+
+def cmd_ledger_export_package(args: argparse.Namespace, storage: Storage) -> int:
+    out_path = Path(args.output)
+    if not out_path.suffix:
+        out_path = out_path.with_suffix(".json")
+    path = storage.export_ledger_package_to_file(args.name, out_path)
+    pkg = storage.export_ledger_package(args.name)
+    print(f"[OK] 台账包已导出: {path}")
+    print(f"  台账名: {pkg['ledger']['name']}")
+    print(f"  记录数: {len(pkg['records'])}")
+    print(f"  导出时间: {pkg['exported_at']}")
+    return 0
+
+
+def cmd_ledger_import(args: argparse.Namespace, storage: Storage) -> int:
+    try:
+        result = storage.import_ledger_package(
+            file_path=args.input,
+            overwrite_ledger=getattr(args, "overwrite_ledger", False),
+            overwrite_record=getattr(args, "overwrite_record", False),
+            ignore_responsible_mismatch=getattr(args, "ignore_responsible_mismatch", False),
+        )
+    except LedgerPackageError:
+        raise
+    except LedgerError:
+        raise
+    except Exception as e:
+        print(f"[导入失败] {e}", file=sys.stderr)
+        return 3
+
+    lines = [f"[OK] 台账包 {result['source_file']} 处理完成"]
+    lines.append(f"  台账名: {result['ledger_name']}")
+    lines.append(f"  总计记录: {result['total_records']} 条")
+    if result["imported_records"]:
+        lines.append(f"  导入记录: {len(result['imported_records'])} 条")
+    if result["skipped_records"]:
+        lines.append(f"  跳过记录: {len(result['skipped_records'])} 条（指纹已存在，未使用 --overwrite-record）")
+    if result["conflicts"]:
+        lines.append(f"  冲突: {len(result['conflicts'])} 条")
+    if result["warnings"]:
+        lines.append("  警告:")
+        for w in result["warnings"]:
+            lines.append(f"    - {w}")
+    print("\n".join(lines))
+
+    has_errors = bool(result.get("conflicts"))
+    has_skips = bool(result.get("skipped_records"))
+    has_imports = bool(result.get("imported_records"))
+
+    if has_errors and not has_imports:
+        return 3
+    if has_skips and not has_imports:
+        print("\n[提示] 上述记录因冲突被跳过，如需覆盖请加 --overwrite-record/--overwrite-ledger", file=sys.stderr)
+    return 0
+
+
+def cmd_ledger_undo(args: argparse.Namespace, storage: Storage) -> int:
+    if getattr(args, "count", False):
+        cnt = storage.get_ledger_undo_count(getattr(args, "name", None))
+        print(f"可撤销台账操作数: {cnt}")
+        return 0
+    try:
+        undo = storage.undo_last_ledger_action(getattr(args, "name", None))
+    except EmptyLedgerUndoError:
+        print("[撤销失败] 没有可撤销的台账操作", file=sys.stderr)
+        return 1
+    print(f"[OK] 已撤销台账「{undo.ledger_name}」操作: {undo.action}")
+    remaining = storage.get_ledger_undo_count(undo.ledger_name)
+    if remaining:
+        print(f"  剩余可撤销: {remaining} 条")
+    return 0
+
+
+def cmd_ledger_log(args: argparse.Namespace, storage: Storage) -> int:
+    logs = storage.get_ledger_audit_log(getattr(args, "name", None))
+    if not logs:
+        print("  (无台账操作记录)")
+        return 0
+    print(f"{'时间':<20} {'操作':<15} {'台账名':<20} 来源/详情")
+    for lg in logs:
+        src = lg.get("source_file") or ""
+        detail = lg.get("detail") or ""
+        extra = src or detail
+        print(
+            f"{lg['created_at']:<20} {lg['action']:<15} "
+            f"{lg['ledger_name']:<20} {extra}"
+        )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="contract-archiver",
@@ -887,6 +1133,88 @@ def build_parser() -> argparse.ArgumentParser:
     pw_log.add_argument("-b", "--batch", help="仅查看指定批次的导入日志（省略则查看全部）")
     pw_log.set_defaults(func=cmd_workpack_log)
 
+    p_ledger = sub.add_parser("ledger", help="补交跟踪台账管理")
+    ledger_sub = p_ledger.add_subparsers(dest="ledger_action", required=True)
+
+    pl_create = ledger_sub.add_parser("create", help="从批次或方案创建台账")
+    pl_create.add_argument("name", help="台账名称")
+    pl_create.add_argument("-b", "--batch", required=True, help="批次ID")
+    pl_create.add_argument("--state", choices=["pending", "passed", "ignored"], help="按状态过滤问题")
+    pl_create.add_argument("--severity", choices=["error", "warning"], help="按严重度过滤问题")
+    pl_create.add_argument("--project-type", dest="project_type", help="按项目类型ID过滤问题")
+    pl_create.add_argument("--scheme", help="使用筛选方案过滤问题")
+    pl_create.add_argument("--responsible", help="默认负责人")
+    pl_create.add_argument("--deadline-days", type=int, help="默认截止天数（覆盖配置）")
+    pl_create.add_argument("--overwrite", action="store_true", help="若同名台账已存在则覆盖")
+    pl_create.set_defaults(func=cmd_ledger_create)
+
+    pl_list = ledger_sub.add_parser("list", help="查看台账或待办记录")
+    pl_list.add_argument("name", nargs="?", default=None, help="台账名称（省略则列出所有台账）")
+    pl_list.add_argument("--responsible", help="按负责人过滤")
+    pl_list.add_argument("--overdue", action="store_true", help="仅显示逾期记录")
+    pl_list.add_argument("--project-type", dest="project_type", help="按项目类型ID过滤")
+    pl_list.add_argument("--progress", choices=list(LEDGER_PROGRESS_LABELS.keys()), help="按进度过滤")
+    pl_list.set_defaults(func=cmd_ledger_list)
+
+    pl_update = ledger_sub.add_parser("update", help="更新台账待办记录")
+    pl_update.add_argument("--ledger", required=True, help="台账名称")
+    pl_update.add_argument("--id", type=int, required=True, help="记录ID")
+    pl_update.add_argument("--responsible", help="负责人")
+    pl_update.add_argument("--deadline", help="截止日期 (ISO 格式)")
+    pl_update.add_argument("--priority", choices=list(LEDGER_PRIORITY_LABELS.keys()), help="优先级")
+    pl_update.add_argument("--notes", help="沟通备注")
+    pl_update.add_argument("--progress", choices=list(LEDGER_PROGRESS_LABELS.keys()), help="进度")
+    pl_update.set_defaults(func=cmd_ledger_update)
+
+    pl_del = ledger_sub.add_parser("delete", help="删除台账")
+    pl_del.add_argument("name", help="台账名称")
+    pl_del.set_defaults(func=cmd_ledger_delete)
+
+    pl_cfg = ledger_sub.add_parser("config", help="台账配置管理")
+    cfg_sub = pl_cfg.add_subparsers(dest="config_action", required=True)
+
+    cfg_get = cfg_sub.add_parser("get", help="查看配置项")
+    cfg_get.add_argument("key", help="配置键名")
+    cfg_get.set_defaults(func=cmd_ledger_config_get)
+
+    cfg_set = cfg_sub.add_parser("set", help="设置配置项")
+    cfg_set.add_argument("key", help="配置键名")
+    cfg_set.add_argument("value", help="配置值")
+    cfg_set.set_defaults(func=cmd_ledger_config_set)
+
+    cfg_list = cfg_sub.add_parser("list", help="列出所有配置项")
+    cfg_list.set_defaults(func=cmd_ledger_config_list)
+
+    pl_exp = ledger_sub.add_parser("export", help="导出台账为 CSV/HTML")
+    pl_exp.add_argument("name", help="台账名称")
+    pl_exp.add_argument("-o", "--output", required=True, help="输出文件路径")
+    pl_exp.add_argument("-f", "--format", choices=["csv", "html"], default="html", help="导出格式 (默认: html)")
+    pl_exp.set_defaults(func=cmd_ledger_export)
+
+    pl_exp_pkg = ledger_sub.add_parser("export-pkg", help="导出台账包为 JSON（可导入另一台机器）")
+    pl_exp_pkg.add_argument("name", help="台账名称")
+    pl_exp_pkg.add_argument("-o", "--output", required=True, help="输出 JSON 文件路径")
+    pl_exp_pkg.set_defaults(func=cmd_ledger_export_package)
+
+    pl_imp = ledger_sub.add_parser("import", help="从台账包 JSON 导入")
+    pl_imp.add_argument("input", help="台账包 JSON 文件路径")
+    pl_imp.add_argument("--overwrite-ledger", action="store_true",
+                        help="同名台账已存在时覆盖（危险操作）")
+    pl_imp.add_argument("--overwrite-record", action="store_true",
+                        help="指纹重复的待办记录覆盖（默认跳过）")
+    pl_imp.add_argument("--ignore-responsible-mismatch", action="store_true",
+                        help="忽略负责人映射不一致的警告")
+    pl_imp.set_defaults(func=cmd_ledger_import)
+
+    pl_undo = ledger_sub.add_parser("undo", help="撤销台账操作")
+    pl_undo.add_argument("name", nargs="?", default=None, help="台账名称")
+    pl_undo.add_argument("--count", action="store_true", help="仅显示可撤销操作数量")
+    pl_undo.set_defaults(func=cmd_ledger_undo)
+
+    pl_log = ledger_sub.add_parser("log", help="查看台账操作日志")
+    pl_log.add_argument("name", nargs="?", default=None, help="台账名称")
+    pl_log.set_defaults(func=cmd_ledger_log)
+
     return parser
 
 
@@ -940,6 +1268,42 @@ def main(argv: list[str] | None = None) -> int:
     except EmptyWorkPackageUndoError as e:
         print(str(e), file=sys.stderr)
         return 22
+    except LedgerNotFoundError as e:
+        print(str(e), file=sys.stderr)
+        return 23
+    except LedgerExistsError as e:
+        print(str(e), file=sys.stderr)
+        return 24
+    except LedgerRecordExistsError as e:
+        print(str(e), file=sys.stderr)
+        return 25
+    except LedgerConfigError as e:
+        print(str(e), file=sys.stderr)
+        return 26
+    except EmptyLedgerUndoError as e:
+        print(str(e), file=sys.stderr)
+        return 27
+    except LedgerImportConflictError as e:
+        print(str(e), file=sys.stderr)
+        return 28
+    except LedgerResponsibleMismatchError as e:
+        print(str(e), file=sys.stderr)
+        return 29
+    except LedgerPackageEmptyError as e:
+        print(str(e), file=sys.stderr)
+        return 30
+    except LedgerPackageParseError as e:
+        print(str(e), file=sys.stderr)
+        return 31
+    except LedgerPackageMissingFieldError as e:
+        print(str(e), file=sys.stderr)
+        return 32
+    except InvalidLedgerPackageError as e:
+        print(str(e), file=sys.stderr)
+        return 33
+    except LedgerError as e:
+        print(str(e), file=sys.stderr)
+        return 34
     except DatabasePermissionError as e:
         print(str(e), file=sys.stderr)
         return 9

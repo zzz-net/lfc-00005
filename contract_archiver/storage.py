@@ -6,7 +6,7 @@ import sqlite3
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
@@ -33,6 +33,19 @@ from .exceptions import (
     WorkPackageRuleMismatchError,
     WorkPackageSchemeExistsError,
     EmptyWorkPackageUndoError,
+    LedgerError,
+    LedgerNotFoundError,
+    LedgerExistsError,
+    LedgerRecordExistsError,
+    LedgerConfigError,
+    EmptyLedgerUndoError,
+    LedgerImportConflictError,
+    LedgerResponsibleMismatchError,
+    LedgerPackageError,
+    LedgerPackageEmptyError,
+    LedgerPackageParseError,
+    LedgerPackageMissingFieldError,
+    InvalidLedgerPackageError,
 )
 from . import __version__ as PACKAGE_VERSION
 from .scanner import IssueSeverity, IssueType, ScanIssue, ScanResult, ProjectScanResult
@@ -295,6 +308,99 @@ class FilterScheme:
         }
 
 
+LEDGER_PROGRESS_LABELS = {
+    "pending": "待处理",
+    "in_progress": "跟进中",
+    "submitted": "已提交",
+    "confirmed": "已确认",
+    "closed": "已关闭",
+}
+
+LEDGER_PRIORITY_LABELS = {
+    "high": "高",
+    "medium": "中",
+    "low": "低",
+}
+
+VALID_LEDGER_PROGRESS = set(LEDGER_PROGRESS_LABELS.keys())
+VALID_LEDGER_PRIORITY = set(LEDGER_PRIORITY_LABELS.keys())
+VALID_LEDGER_CONFIG_KEYS = {"default_deadline_days", "priority_rules", "responsible_mapping"}
+
+
+@dataclass
+class LedgerRecord:
+    id: int
+    ledger_name: str
+    issue_id: int
+    batch_id: str
+    project_path: str
+    project_name: str
+    project_type_id: str | None
+    issue_type: str
+    severity: str
+    rule_name: str | None
+    file_path: str | None
+    message: str
+    fingerprint: str | None
+    responsible_person: str | None
+    deadline: str | None
+    priority: str
+    communication_notes: str | None
+    progress: str
+    created_at: str
+    updated_at: str
+    import_source: str | None = None
+
+    @property
+    def priority_label(self) -> str:
+        return LEDGER_PRIORITY_LABELS.get(self.priority, self.priority)
+
+    @property
+    def progress_label(self) -> str:
+        return LEDGER_PROGRESS_LABELS.get(self.progress, self.progress)
+
+    @property
+    def is_overdue(self) -> bool:
+        if not self.deadline:
+            return False
+        try:
+            return datetime.fromisoformat(self.deadline) < datetime.now()
+        except (ValueError, TypeError):
+            return False
+
+
+@dataclass
+class LedgerInfo:
+    name: str
+    batch_id: str
+    record_count: int = 0
+    pending_count: int = 0
+    in_progress_count: int = 0
+    submitted_count: int = 0
+    confirmed_count: int = 0
+    closed_count: int = 0
+    overdue_count: int = 0
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass
+class LedgerConfigRecord:
+    id: int
+    key: str
+    value: str
+    updated_at: str
+
+
+@dataclass
+class LedgerUndoRecord:
+    id: int
+    ledger_name: str
+    action: str
+    old_data: str
+    created_at: str
+
+
 class Storage:
     def __init__(self, db_path: str | os.PathLike = None):
         if db_path is None:
@@ -495,6 +601,72 @@ class Storage:
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_import_undo_batch ON import_undo_log(batch_id);
+                """
+            )
+
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS ledgers (
+                    name TEXT PRIMARY KEY,
+                    batch_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS ledger_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ledger_name TEXT NOT NULL REFERENCES ledgers(name) ON DELETE CASCADE,
+                    issue_id INTEGER NOT NULL,
+                    batch_id TEXT NOT NULL,
+                    project_path TEXT NOT NULL,
+                    project_name TEXT NOT NULL,
+                    project_type_id TEXT,
+                    issue_type TEXT NOT NULL,
+                    severity TEXT NOT NULL,
+                    rule_name TEXT,
+                    file_path TEXT,
+                    message TEXT NOT NULL,
+                    fingerprint TEXT,
+                    responsible_person TEXT,
+                    deadline TEXT,
+                    priority TEXT NOT NULL DEFAULT 'medium',
+                    communication_notes TEXT,
+                    progress TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    import_source TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_ledger_records_name ON ledger_records(ledger_name);
+                CREATE INDEX IF NOT EXISTS idx_ledger_records_batch ON ledger_records(batch_id);
+                CREATE INDEX IF NOT EXISTS idx_ledger_records_person ON ledger_records(responsible_person);
+                CREATE INDEX IF NOT EXISTS idx_ledger_records_fingerprint ON ledger_records(fingerprint);
+
+                CREATE TABLE IF NOT EXISTS ledger_config (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    key TEXT NOT NULL UNIQUE,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS ledger_audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ledger_name TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    detail TEXT,
+                    source_file TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_ledger_audit_name ON ledger_audit_log(ledger_name);
+
+                CREATE TABLE IF NOT EXISTS ledger_undo_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ledger_name TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    old_data TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -2030,3 +2202,830 @@ class Storage:
                     d["imported_scheme_names"] = []
                 result.append(d)
             return result
+
+    def _row_to_ledger_record(self, r: sqlite3.Row) -> LedgerRecord:
+        return LedgerRecord(
+            id=r["id"],
+            ledger_name=r["ledger_name"],
+            issue_id=r["issue_id"],
+            batch_id=r["batch_id"],
+            project_path=r["project_path"],
+            project_name=r["project_name"],
+            project_type_id=r["project_type_id"],
+            issue_type=r["issue_type"],
+            severity=r["severity"],
+            rule_name=r["rule_name"],
+            file_path=r["file_path"],
+            message=r["message"],
+            fingerprint=r["fingerprint"],
+            responsible_person=r["responsible_person"],
+            deadline=r["deadline"],
+            priority=r["priority"],
+            communication_notes=r["communication_notes"],
+            progress=r["progress"],
+            created_at=r["created_at"],
+            updated_at=r["updated_at"],
+            import_source=r["import_source"] if "import_source" in set(r.keys()) else None,
+        )
+
+    def _build_ledger_info(self, r: sqlite3.Row) -> LedgerInfo:
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        record_count = r["record_count"] or 0
+        pending_count = r["pending_count"] or 0
+        in_progress_count = r["in_progress_count"] or 0
+        submitted_count = r["submitted_count"] or 0
+        confirmed_count = r["confirmed_count"] or 0
+        closed_count = r["closed_count"] or 0
+        overdue_count = r["overdue_count"] or 0
+        return LedgerInfo(
+            name=r["name"],
+            batch_id=r["batch_id"],
+            record_count=record_count,
+            pending_count=pending_count,
+            in_progress_count=in_progress_count,
+            submitted_count=submitted_count,
+            confirmed_count=confirmed_count,
+            closed_count=closed_count,
+            overdue_count=overdue_count,
+            created_at=r["created_at"] or "",
+            updated_at=r["updated_at"] or now_iso,
+        )
+
+    def _log_ledger_audit(
+        self,
+        conn: sqlite3.Connection,
+        ledger_name: str,
+        action: str,
+        detail: str | None = None,
+        source_file: str | None = None,
+    ) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        conn.execute(
+            """INSERT INTO ledger_audit_log
+            (ledger_name, action, detail, source_file, created_at)
+            VALUES (?, ?, ?, ?, ?)""",
+            (ledger_name, action, detail, source_file, now),
+        )
+
+    def create_ledger(
+        self,
+        name: str,
+        batch_id: str,
+        state: str | None = None,
+        severity: str | None = None,
+        project_type_id: str | None = None,
+        scheme_name: str | None = None,
+        responsible_person: str | None = None,
+        deadline_days: int | None = None,
+        priority_rules: dict[str, str] | None = None,
+        overwrite: bool = False,
+    ) -> tuple[LedgerInfo, list[LedgerRecord], str]:
+        name = name.strip()
+        if not name:
+            raise ValueError("台账名称不能为空")
+
+        now = datetime.now().isoformat(timespec="seconds")
+        result_action = "create"
+
+        issues = self.get_issues(batch_id, state=state, severity=severity, project_type_id=project_type_id)
+
+        if scheme_name:
+            scheme = self.get_scheme(scheme_name)
+            scheme_issues = self.get_issues(
+                batch_id,
+                state=scheme.state,
+                severity=scheme.severity,
+                project_type_id=scheme.project_type_id,
+            )
+            issues = scheme_issues
+
+        if not issues:
+            raise LedgerError(f"批次 {batch_id} 中没有符合条件的问题，无法创建台账")
+
+        config_deadline_days = None
+        config_priority_rules = None
+        config_responsible_mapping = None
+
+        for cfg_key in ("default_deadline_days", "priority_rules", "responsible_mapping"):
+            cfg = self.get_ledger_config(cfg_key)
+            if cfg:
+                if cfg_key == "default_deadline_days":
+                    try:
+                        config_deadline_days = int(cfg.value)
+                    except (ValueError, TypeError):
+                        pass
+                elif cfg_key == "priority_rules":
+                    try:
+                        config_priority_rules = json.loads(cfg.value)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                elif cfg_key == "responsible_mapping":
+                    try:
+                        config_responsible_mapping = json.loads(cfg.value)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+        effective_deadline_days = deadline_days if deadline_days is not None else config_deadline_days
+        effective_priority_rules = priority_rules or config_priority_rules or {}
+
+        with self._tx() as conn:
+            existing = conn.execute(
+                "SELECT name FROM ledgers WHERE name = ?", (name,)
+            ).fetchone()
+
+            if existing and not overwrite:
+                raise LedgerExistsError(name)
+
+            if existing:
+                conn.execute("DELETE FROM ledger_records WHERE ledger_name = ?", (name,))
+                conn.execute("DELETE FROM ledgers WHERE name = ?", (name,))
+                result_action = "overwrite"
+
+            conn.execute(
+                "INSERT INTO ledgers (name, batch_id, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                (name, batch_id, now, now),
+            )
+
+            records: list[LedgerRecord] = []
+            for issue in issues:
+                if issue.fingerprint:
+                    dup = conn.execute(
+                        "SELECT id FROM ledger_records WHERE ledger_name = ? AND fingerprint = ?",
+                        (name, issue.fingerprint),
+                    ).fetchone()
+                    if dup:
+                        raise LedgerRecordExistsError(name, issue.fingerprint)
+
+                resolved_person = responsible_person
+                if not resolved_person and config_responsible_mapping and issue.rule_name:
+                    resolved_person = config_responsible_mapping.get(issue.rule_name)
+
+                priority = effective_priority_rules.get(issue.severity, "medium")
+                if not effective_priority_rules:
+                    if issue.severity == "error":
+                        priority = "high"
+                    elif issue.severity == "warning":
+                        priority = "medium"
+
+                deadline = None
+                if effective_deadline_days is not None:
+                    try:
+                        deadline_dt = datetime.now() + timedelta(days=effective_deadline_days)
+                        deadline = deadline_dt.isoformat(timespec="seconds")
+                    except (ValueError, TypeError):
+                        pass
+
+                conn.execute(
+                    """INSERT INTO ledger_records
+                    (ledger_name, issue_id, batch_id, project_path, project_name, project_type_id,
+                     issue_type, severity, rule_name, file_path, message, fingerprint,
+                     responsible_person, deadline, priority, communication_notes, progress,
+                     created_at, updated_at, import_source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        name, issue.id, batch_id, issue.project_path, issue.project_name,
+                        issue.project_type_id, issue.issue_type, issue.severity, issue.rule_name,
+                        issue.file_path, issue.message, issue.fingerprint,
+                        resolved_person, deadline, priority, None, "pending",
+                        now, now, None,
+                    ),
+                )
+                rec_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                records.append(LedgerRecord(
+                    id=rec_id,
+                    ledger_name=name,
+                    issue_id=issue.id,
+                    batch_id=batch_id,
+                    project_path=issue.project_path,
+                    project_name=issue.project_name,
+                    project_type_id=issue.project_type_id,
+                    issue_type=issue.issue_type,
+                    severity=issue.severity,
+                    rule_name=issue.rule_name,
+                    file_path=issue.file_path,
+                    message=issue.message,
+                    fingerprint=issue.fingerprint,
+                    responsible_person=resolved_person,
+                    deadline=deadline,
+                    priority=priority,
+                    communication_notes=None,
+                    progress="pending",
+                    created_at=now,
+                    updated_at=now,
+                    import_source=None,
+                ))
+
+            detail_parts = [f"batch={batch_id}", f"records={len(records)}"]
+            if state:
+                detail_parts.append(f"state={state}")
+            if severity:
+                detail_parts.append(f"severity={severity}")
+            if scheme_name:
+                detail_parts.append(f"scheme={scheme_name}")
+            self._log_ledger_audit(
+                conn, name, "create", detail=";".join(detail_parts),
+            )
+
+            ledger_info = LedgerInfo(
+                name=name,
+                batch_id=batch_id,
+                record_count=len(records),
+                pending_count=sum(1 for r in records if r.progress == "pending"),
+                in_progress_count=sum(1 for r in records if r.progress == "in_progress"),
+                submitted_count=sum(1 for r in records if r.progress == "submitted"),
+                confirmed_count=sum(1 for r in records if r.progress == "confirmed"),
+                closed_count=sum(1 for r in records if r.progress == "closed"),
+                overdue_count=sum(1 for r in records if r.is_overdue),
+                created_at=now,
+                updated_at=now,
+            )
+
+            return ledger_info, records, result_action
+
+    def list_ledgers(self) -> list[LedgerInfo]:
+        sql = """SELECT l.name, l.batch_id, l.created_at, l.updated_at,
+                 COUNT(lr.id) as record_count,
+                 SUM(CASE WHEN lr.progress='pending' THEN 1 ELSE 0 END) as pending_count,
+                 SUM(CASE WHEN lr.progress='in_progress' THEN 1 ELSE 0 END) as in_progress_count,
+                 SUM(CASE WHEN lr.progress='submitted' THEN 1 ELSE 0 END) as submitted_count,
+                 SUM(CASE WHEN lr.progress='confirmed' THEN 1 ELSE 0 END) as confirmed_count,
+                 SUM(CASE WHEN lr.progress='closed' THEN 1 ELSE 0 END) as closed_count,
+                 SUM(CASE WHEN lr.deadline IS NOT NULL AND lr.deadline < ? AND lr.progress NOT IN ('confirmed','closed') THEN 1 ELSE 0 END) as overdue_count
+                 FROM ledgers l LEFT JOIN ledger_records lr ON l.name = lr.ledger_name
+                 GROUP BY l.name
+                 ORDER BY l.updated_at DESC, l.name ASC"""
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        with self._conn() as conn:
+            rows = conn.execute(sql, (now_iso,)).fetchall()
+            return [self._build_ledger_info(r) for r in rows]
+
+    def get_ledger(self, name: str) -> LedgerInfo | None:
+        sql = """SELECT l.name, l.batch_id, l.created_at, l.updated_at,
+                 COUNT(lr.id) as record_count,
+                 SUM(CASE WHEN lr.progress='pending' THEN 1 ELSE 0 END) as pending_count,
+                 SUM(CASE WHEN lr.progress='in_progress' THEN 1 ELSE 0 END) as in_progress_count,
+                 SUM(CASE WHEN lr.progress='submitted' THEN 1 ELSE 0 END) as submitted_count,
+                 SUM(CASE WHEN lr.progress='confirmed' THEN 1 ELSE 0 END) as confirmed_count,
+                 SUM(CASE WHEN lr.progress='closed' THEN 1 ELSE 0 END) as closed_count,
+                 SUM(CASE WHEN lr.deadline IS NOT NULL AND lr.deadline < ? AND lr.progress NOT IN ('confirmed','closed') THEN 1 ELSE 0 END) as overdue_count
+                 FROM ledgers l LEFT JOIN ledger_records lr ON l.name = lr.ledger_name
+                 WHERE l.name = ?
+                 GROUP BY l.name"""
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        with self._conn() as conn:
+            row = conn.execute(sql, (now_iso, name)).fetchone()
+            if row is None or row["name"] is None:
+                return None
+            return self._build_ledger_info(row)
+
+    def get_ledger_records(
+        self,
+        ledger_name: str,
+        responsible_person: str | None = None,
+        overdue: bool | None = None,
+        project_type_id: str | None = None,
+        progress: str | None = None,
+    ) -> list[LedgerRecord]:
+        sql = "SELECT * FROM ledger_records WHERE ledger_name = ?"
+        params: list[Any] = [ledger_name]
+        if responsible_person:
+            sql += " AND responsible_person = ?"
+            params.append(responsible_person)
+        if overdue:
+            now_iso = datetime.now().isoformat(timespec="seconds")
+            sql += " AND deadline IS NOT NULL AND deadline < ? AND progress NOT IN ('confirmed', 'closed')"
+            params.append(now_iso)
+        if project_type_id:
+            sql += " AND project_type_id = ?"
+            params.append(project_type_id)
+        if progress:
+            sql += " AND progress = ?"
+            params.append(progress)
+        sql += " ORDER BY project_name, id"
+
+        with self._conn() as conn:
+            rows = conn.execute(sql, params).fetchall()
+            return [self._row_to_ledger_record(r) for r in rows]
+
+    def update_ledger_record(
+        self,
+        ledger_name: str,
+        record_id: int,
+        responsible_person: str | None = None,
+        deadline: str | None = None,
+        priority: str | None = None,
+        communication_notes: str | None = None,
+        progress: str | None = None,
+    ) -> LedgerRecord:
+        if progress and progress not in VALID_LEDGER_PROGRESS:
+            raise LedgerConfigError(f"无效的进度值: {progress}", field="progress")
+        if priority and priority not in VALID_LEDGER_PRIORITY:
+            raise LedgerConfigError(f"无效的优先级值: {priority}", field="priority")
+
+        now = datetime.now().isoformat(timespec="seconds")
+
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT * FROM ledger_records WHERE id = ? AND ledger_name = ?",
+                (record_id, ledger_name),
+            ).fetchone()
+            if row is None:
+                raise LedgerNotFoundError(f"台账 {ledger_name} 中不存在记录 id={record_id}")
+
+            old_data = json.dumps({
+                "responsible_person": row["responsible_person"],
+                "deadline": row["deadline"],
+                "priority": row["priority"],
+                "communication_notes": row["communication_notes"],
+                "progress": row["progress"],
+            }, ensure_ascii=False)
+
+            new_responsible = responsible_person if responsible_person is not None else row["responsible_person"]
+            new_deadline = deadline if deadline is not None else row["deadline"]
+            new_priority = priority if priority is not None else row["priority"]
+            new_notes = communication_notes if communication_notes is not None else row["communication_notes"]
+            new_progress = progress if progress is not None else row["progress"]
+
+            conn.execute(
+                """UPDATE ledger_records
+                SET responsible_person=?, deadline=?, priority=?, communication_notes=?,
+                    progress=?, updated_at=?
+                WHERE id=?""",
+                (new_responsible, new_deadline, new_priority, new_notes, new_progress, now, record_id),
+            )
+
+            conn.execute(
+                """INSERT INTO ledger_undo_log
+                (ledger_name, action, old_data, created_at)
+                VALUES (?, ?, ?, ?)""",
+                (ledger_name, "update_record", old_data, now),
+            )
+
+            changes = []
+            if responsible_person is not None and row["responsible_person"] != responsible_person:
+                changes.append(f"负责人: {row['responsible_person']} → {responsible_person}")
+            if deadline is not None and row["deadline"] != deadline:
+                changes.append(f"截止日期: {row['deadline']} → {deadline}")
+            if priority is not None and row["priority"] != priority:
+                changes.append(f"优先级: {row['priority']} → {priority}")
+            if progress is not None and row["progress"] != progress:
+                changes.append(f"进度: {row['progress']} → {progress}")
+            detail = "; ".join(changes) if changes else None
+
+            self._log_ledger_audit(
+                conn, ledger_name, "update_record", detail=detail,
+            )
+
+            updated = conn.execute(
+                "SELECT * FROM ledger_records WHERE id = ?", (record_id,)
+            ).fetchone()
+            return self._row_to_ledger_record(updated)
+
+    def delete_ledger(self, name: str) -> None:
+        with self._tx() as conn:
+            existing = conn.execute(
+                "SELECT name FROM ledgers WHERE name = ?", (name,)
+            ).fetchone()
+            if existing is None:
+                raise LedgerNotFoundError(name)
+
+            self._log_ledger_audit(conn, name, "delete", detail=f"删除台账 {name} 及其所有记录")
+
+            conn.execute("DELETE FROM ledger_records WHERE ledger_name = ?", (name,))
+            conn.execute("DELETE FROM ledger_undo_log WHERE ledger_name = ?", (name,))
+            conn.execute("DELETE FROM ledgers WHERE name = ?", (name,))
+
+    def get_ledger_config(self, key: str) -> LedgerConfigRecord | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM ledger_config WHERE key = ?", (key,)
+            ).fetchone()
+            if row is None:
+                return None
+            return LedgerConfigRecord(
+                id=row["id"],
+                key=row["key"],
+                value=row["value"],
+                updated_at=row["updated_at"],
+            )
+
+    def set_ledger_config(self, key: str, value: str) -> LedgerConfigRecord:
+        if key not in VALID_LEDGER_CONFIG_KEYS:
+            raise LedgerConfigError(
+                f"无效的配置键: {key}，有效键为: {', '.join(sorted(VALID_LEDGER_CONFIG_KEYS))}",
+                field="key",
+            )
+
+        if key == "default_deadline_days":
+            try:
+                val = int(value)
+                if val <= 0:
+                    raise LedgerConfigError("default_deadline_days 必须为正整数", field="value")
+            except (ValueError, TypeError):
+                raise LedgerConfigError("default_deadline_days 必须为正整数", field="value")
+        elif key == "priority_rules":
+            try:
+                parsed = json.loads(value)
+                if not isinstance(parsed, dict):
+                    raise LedgerConfigError("priority_rules 必须为 JSON 对象", field="value")
+                for k, v in parsed.items():
+                    if v not in VALID_LEDGER_PRIORITY:
+                        raise LedgerConfigError(
+                            f"priority_rules 中值 '{v}' 不是有效优先级（应为 {', '.join(sorted(VALID_LEDGER_PRIORITY))}）",
+                            field="value",
+                        )
+            except json.JSONDecodeError as e:
+                raise LedgerConfigError(f"priority_rules 不是有效的 JSON: {e}", field="value")
+        elif key == "responsible_mapping":
+            try:
+                parsed = json.loads(value)
+                if not isinstance(parsed, dict):
+                    raise LedgerConfigError("responsible_mapping 必须为 JSON 对象", field="value")
+            except json.JSONDecodeError as e:
+                raise LedgerConfigError(f"responsible_mapping 不是有效的 JSON: {e}", field="value")
+
+        now = datetime.now().isoformat(timespec="seconds")
+
+        with self._tx() as conn:
+            existing = conn.execute(
+                "SELECT * FROM ledger_config WHERE key = ?", (key,)
+            ).fetchone()
+
+            if existing:
+                conn.execute(
+                    "UPDATE ledger_config SET value=?, updated_at=? WHERE key=?",
+                    (value, now, key),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO ledger_config (key, value, updated_at) VALUES (?, ?, ?)",
+                    (key, value, now),
+                )
+
+            row = conn.execute(
+                "SELECT * FROM ledger_config WHERE key = ?", (key,)
+            ).fetchone()
+            return LedgerConfigRecord(
+                id=row["id"],
+                key=row["key"],
+                value=row["value"],
+                updated_at=row["updated_at"],
+            )
+
+    def list_ledger_config(self) -> list[LedgerConfigRecord]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM ledger_config ORDER BY key"
+            ).fetchall()
+            return [
+                LedgerConfigRecord(
+                    id=r["id"],
+                    key=r["key"],
+                    value=r["value"],
+                    updated_at=r["updated_at"],
+                )
+                for r in rows
+            ]
+
+    def export_ledger_package(self, name: str) -> dict[str, Any]:
+        ledger = self.get_ledger(name)
+        if ledger is None:
+            raise LedgerNotFoundError(name)
+
+        records = self.get_ledger_records(name)
+        config_records = self.list_ledger_config()
+
+        records_data = []
+        for r in records:
+            records_data.append({
+                "id": r.id,
+                "issue_id": r.issue_id,
+                "batch_id": r.batch_id,
+                "project_path": r.project_path,
+                "project_name": r.project_name,
+                "project_type_id": r.project_type_id,
+                "issue_type": r.issue_type,
+                "severity": r.severity,
+                "rule_name": r.rule_name,
+                "file_path": r.file_path,
+                "message": r.message,
+                "fingerprint": r.fingerprint,
+                "responsible_person": r.responsible_person,
+                "deadline": r.deadline,
+                "priority": r.priority,
+                "communication_notes": r.communication_notes,
+                "progress": r.progress,
+                "created_at": r.created_at,
+                "updated_at": r.updated_at,
+                "import_source": r.import_source,
+            })
+
+        config_data = {}
+        for c in config_records:
+            config_data[c.key] = c.value
+
+        return {
+            "package_version": 1,
+            "package_type": "ledger_package",
+            "tool_version": PACKAGE_VERSION,
+            "exported_at": datetime.now().isoformat(timespec="seconds"),
+            "ledger": {
+                "name": ledger.name,
+                "batch_id": ledger.batch_id,
+                "record_count": ledger.record_count,
+                "pending_count": ledger.pending_count,
+                "in_progress_count": ledger.in_progress_count,
+                "submitted_count": ledger.submitted_count,
+                "confirmed_count": ledger.confirmed_count,
+                "closed_count": ledger.closed_count,
+                "overdue_count": ledger.overdue_count,
+                "created_at": ledger.created_at,
+                "updated_at": ledger.updated_at,
+            },
+            "records": records_data,
+            "config": config_data,
+        }
+
+    def export_ledger_package_to_file(self, name: str, output_path: str | os.PathLike) -> Path:
+        pkg = self.export_ledger_package(name)
+        out = Path(output_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(pkg, ensure_ascii=False, indent=2), encoding="utf-8")
+        return out
+
+    def import_ledger_package(
+        self,
+        file_path: str | os.PathLike,
+        overwrite_ledger: bool = False,
+        overwrite_record: bool = False,
+        ignore_responsible_mismatch: bool = False,
+    ) -> dict[str, Any]:
+        fp = Path(file_path)
+        abs_path = str(fp.resolve())
+        raw = fp.read_text(encoding="utf-8")
+        if not raw.strip():
+            raise LedgerPackageEmptyError(abs_path)
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise LedgerPackageParseError(abs_path, f"JSON 格式错误: {e.msg} (行{e.lineno}, 列{e.colno})") from e
+
+        if not isinstance(data, dict):
+            raise InvalidLedgerPackageError(f"文件 {abs_path} 顶层结构应为 JSON 对象")
+        if data.get("package_type") != "ledger_package":
+            raise InvalidLedgerPackageError(f"文件 {abs_path} 不是有效的台账包（缺少 package_type=ledger_package）")
+
+        for fld in ("ledger", "records"):
+            if fld not in data:
+                raise LedgerPackageMissingFieldError(abs_path, fld)
+
+        ledger_data = data["ledger"]
+        for fld in ("name", "batch_id"):
+            if fld not in ledger_data:
+                raise LedgerPackageMissingFieldError(abs_path, fld, "ledger")
+
+        records_data = data["records"]
+        if not isinstance(records_data, list):
+            raise InvalidLedgerPackageError(f"文件 {abs_path} 的 'records' 字段应为数组")
+
+        config_data = data.get("config", {})
+        ledger_name = ledger_data["name"].strip()
+        batch_id = ledger_data["batch_id"]
+
+        result: dict[str, Any] = {
+            "source_file": abs_path,
+            "package_version": data.get("package_version"),
+            "tool_version": data.get("tool_version"),
+            "exported_at": data.get("exported_at"),
+            "ledger_name": ledger_name,
+            "total_records": len(records_data),
+            "imported_records": [],
+            "skipped_records": [],
+            "conflicts": [],
+            "warnings": [],
+        }
+
+        with self._tx() as conn:
+            existing_ledger = conn.execute(
+                "SELECT name FROM ledgers WHERE name = ?", (ledger_name,)
+            ).fetchone()
+
+            if existing_ledger and not overwrite_ledger:
+                raise LedgerImportConflictError(ledger_name, "台账已存在")
+
+            if existing_ledger:
+                conn.execute("DELETE FROM ledger_records WHERE ledger_name = ?", (ledger_name,))
+                conn.execute("DELETE FROM ledgers WHERE name = ?", (ledger_name,))
+
+            now = datetime.now().isoformat(timespec="seconds")
+            conn.execute(
+                "INSERT INTO ledgers (name, batch_id, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                (
+                    ledger_name,
+                    batch_id,
+                    ledger_data.get("created_at") or now,
+                    ledger_data.get("updated_at") or now,
+                ),
+            )
+
+            local_responsible_cfg = self.get_ledger_config("responsible_mapping")
+            local_mapping: dict[str, str] = {}
+            if local_responsible_cfg:
+                try:
+                    local_mapping = json.loads(local_responsible_cfg.value)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            import_mapping: dict[str, str] = {}
+            if isinstance(config_data, dict) and "responsible_mapping" in config_data:
+                try:
+                    import_mapping = json.loads(config_data["responsible_mapping"])
+                except (json.JSONDecodeError, TypeError):
+                    import_mapping = config_data.get("responsible_mapping", {})
+                    if not isinstance(import_mapping, dict):
+                        import_mapping = {}
+
+            if local_mapping and import_mapping and not ignore_responsible_mismatch:
+                for person_key in set(local_mapping.keys()) & set(import_mapping.keys()):
+                    if local_mapping[person_key] != import_mapping[person_key]:
+                        raise LedgerResponsibleMismatchError(
+                            person_key, local_mapping[person_key], import_mapping[person_key]
+                        )
+
+            for rec in records_data:
+                if not isinstance(rec, dict):
+                    result["warnings"].append("跳过无效的记录格式")
+                    continue
+
+                fingerprint = rec.get("fingerprint")
+                if fingerprint:
+                    dup = conn.execute(
+                        "SELECT id FROM ledger_records WHERE ledger_name = ? AND fingerprint = ?",
+                        (ledger_name, fingerprint),
+                    ).fetchone()
+                    if dup and not overwrite_record:
+                        result["skipped_records"].append({
+                            "fingerprint": fingerprint,
+                            "project_name": rec.get("project_name"),
+                            "rule_name": rec.get("rule_name"),
+                        })
+                        continue
+
+                progress = rec.get("progress", "pending")
+                if progress not in VALID_LEDGER_PROGRESS:
+                    progress = "pending"
+                priority = rec.get("priority", "medium")
+                if priority not in VALID_LEDGER_PRIORITY:
+                    priority = "medium"
+
+                conn.execute(
+                    """INSERT INTO ledger_records
+                    (ledger_name, issue_id, batch_id, project_path, project_name, project_type_id,
+                     issue_type, severity, rule_name, file_path, message, fingerprint,
+                     responsible_person, deadline, priority, communication_notes, progress,
+                     created_at, updated_at, import_source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        ledger_name,
+                        rec.get("issue_id", 0),
+                        rec.get("batch_id", batch_id),
+                        rec.get("project_path", ""),
+                        rec.get("project_name", ""),
+                        rec.get("project_type_id"),
+                        rec.get("issue_type", ""),
+                        rec.get("severity", ""),
+                        rec.get("rule_name"),
+                        rec.get("file_path"),
+                        rec.get("message", ""),
+                        fingerprint,
+                        rec.get("responsible_person"),
+                        rec.get("deadline"),
+                        priority,
+                        rec.get("communication_notes"),
+                        progress,
+                        rec.get("created_at") or now,
+                        rec.get("updated_at") or now,
+                        f"import:{fp.name}",
+                    ),
+                )
+                new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                result["imported_records"].append({
+                    "new_id": new_id,
+                    "project_name": rec.get("project_name"),
+                    "rule_name": rec.get("rule_name"),
+                    "progress": progress,
+                })
+
+            if config_data:
+                for cfg_key, cfg_value in config_data.items():
+                    if cfg_key not in VALID_LEDGER_CONFIG_KEYS:
+                        continue
+                    if isinstance(cfg_value, dict) or isinstance(cfg_value, list):
+                        cfg_value = json.dumps(cfg_value, ensure_ascii=False)
+                    elif not isinstance(cfg_value, str):
+                        cfg_value = str(cfg_value)
+                    existing_cfg = conn.execute(
+                        "SELECT id FROM ledger_config WHERE key = ?", (cfg_key,)
+                    ).fetchone()
+                    if existing_cfg:
+                        conn.execute(
+                            "UPDATE ledger_config SET value=?, updated_at=? WHERE key=?",
+                            (cfg_value, now, cfg_key),
+                        )
+                    else:
+                        conn.execute(
+                            "INSERT INTO ledger_config (key, value, updated_at) VALUES (?, ?, ?)",
+                            (cfg_key, cfg_value, now),
+                        )
+
+            self._log_ledger_audit(
+                conn, ledger_name, "import",
+                detail=f"导入 {len(result['imported_records'])} 条记录",
+                source_file=abs_path,
+            )
+
+        return result
+
+    def get_ledger_undo_count(self, ledger_name: str | None = None) -> int:
+        with self._conn() as conn:
+            if ledger_name:
+                row = conn.execute(
+                    "SELECT COUNT(*) as cnt FROM ledger_undo_log WHERE ledger_name = ?",
+                    (ledger_name,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) as cnt FROM ledger_undo_log"
+                ).fetchone()
+            return row["cnt"] or 0
+
+    def undo_last_ledger_action(self, ledger_name: str | None = None) -> LedgerUndoRecord:
+        with self._tx() as conn:
+            if ledger_name:
+                row = conn.execute(
+                    "SELECT * FROM ledger_undo_log WHERE ledger_name = ? ORDER BY id DESC LIMIT 1",
+                    (ledger_name,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM ledger_undo_log ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+
+            if row is None:
+                raise EmptyLedgerUndoError()
+
+            undo = LedgerUndoRecord(
+                id=row["id"],
+                ledger_name=row["ledger_name"],
+                action=row["action"],
+                old_data=row["old_data"],
+                created_at=row["created_at"],
+            )
+
+            if undo.action == "update_record":
+                try:
+                    old = json.loads(undo.old_data)
+                except (json.JSONDecodeError, TypeError):
+                    old = {}
+
+                now = datetime.now().isoformat(timespec="seconds")
+                latest = conn.execute(
+                    "SELECT * FROM ledger_records WHERE ledger_name = ? ORDER BY updated_at DESC, id DESC LIMIT 1",
+                    (undo.ledger_name,),
+                ).fetchone()
+                if latest:
+                    conn.execute(
+                        """UPDATE ledger_records
+                        SET responsible_person=?, deadline=?, priority=?,
+                            communication_notes=?, progress=?, updated_at=?
+                        WHERE id=?""",
+                        (
+                            old.get("responsible_person", latest["responsible_person"]),
+                            old.get("deadline", latest["deadline"]),
+                            old.get("priority", latest["priority"]),
+                            old.get("communication_notes", latest["communication_notes"]),
+                            old.get("progress", latest["progress"]),
+                            now,
+                            latest["id"],
+                        ),
+                    )
+
+            conn.execute("DELETE FROM ledger_undo_log WHERE id = ?", (undo.id,))
+
+            self._log_ledger_audit(
+                conn, undo.ledger_name, "undo",
+                detail=f"撤销操作: {undo.action}",
+            )
+
+            return undo
+
+    def get_ledger_audit_log(self, ledger_name: str | None = None) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM ledger_audit_log"
+        params: list[Any] = []
+        if ledger_name:
+            sql += " WHERE ledger_name = ?"
+            params.append(ledger_name)
+        sql += " ORDER BY created_at ASC, id ASC"
+        with self._conn() as conn:
+            rows = conn.execute(sql, params).fetchall()
+            return [dict(r) for r in rows]

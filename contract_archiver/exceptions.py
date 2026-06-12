@@ -178,3 +178,83 @@ class WorkPackageSchemeExistsError(WorkPackageError):
 class EmptyWorkPackageUndoError(ContractArchiverError):
     def __init__(self):
         super().__init__("[撤销失败] 没有可撤销的工作包导入操作")
+
+
+class LedgerError(ContractArchiverError):
+    """台账通用错误基类"""
+    pass
+
+
+class LedgerNotFoundError(LedgerError):
+    def __init__(self, name: str):
+        super().__init__(f"[台账不存在] 未找到台账: {name}")
+
+
+class LedgerExistsError(LedgerError):
+    def __init__(self, name: str):
+        super().__init__(f"[台账已存在] 台账 '{name}' 已存在，使用 --overwrite 可覆盖")
+
+
+class LedgerRecordExistsError(LedgerError):
+    def __init__(self, ledger_name: str, issue_fingerprint: str):
+        super().__init__(
+            f"[待办重复] 台账 '{ledger_name}' 中已存在指纹 {issue_fingerprint} 的待办记录，"
+            f"使用 --overwrite-record 可覆盖"
+        )
+
+
+class LedgerConfigError(LedgerError):
+    def __init__(self, message: str, field: str | None = None):
+        prefix = f"[台账配置错误] {f'{field}: ' if field else ''}"
+        super().__init__(f"{prefix}{message}")
+        self.field = field
+
+
+class EmptyLedgerUndoError(LedgerError):
+    def __init__(self):
+        super().__init__("[撤销失败] 没有可撤销的台账操作")
+
+
+class LedgerImportConflictError(LedgerError):
+    def __init__(self, name: str, detail: str):
+        super().__init__(
+            f"[台账导入冲突] 台账 '{name}' {detail}，"
+            f"使用 --overwrite-ledger 可覆盖同名台账，使用 --overwrite-record 可覆盖重复待办"
+        )
+
+
+class LedgerResponsibleMismatchError(LedgerError):
+    def __init__(self, person: str, local_person: str, import_person: str):
+        super().__init__(
+            f"[负责人映射不一致] 负责人 '{person}' 本地映射为 '{local_person}'，"
+            f"导入文件映射为 '{import_person}'，"
+            f"使用 --ignore-responsible-mismatch 可忽略差异"
+        )
+
+
+class LedgerPackageError(LedgerError):
+    """台账导入包通用错误基类"""
+    pass
+
+
+class LedgerPackageEmptyError(LedgerPackageError):
+    def __init__(self, file_path: str):
+        super().__init__(f"[台账包为空] 台账包文件 {file_path} 为空，没有可导入的内容")
+
+
+class LedgerPackageParseError(LedgerPackageError):
+    def __init__(self, file_path: str, detail: str):
+        super().__init__(f"[台账包解析失败] 无法解析文件 {file_path}: {detail}")
+
+
+class LedgerPackageMissingFieldError(LedgerPackageError):
+    def __init__(self, file_path: str, field: str, section: str | None = None):
+        pos = f"（{section}）" if section else ""
+        super().__init__(
+            f"[台账包缺字段] 文件 {file_path}{pos} 缺少必填字段: {field}"
+        )
+
+
+class InvalidLedgerPackageError(LedgerPackageError):
+    def __init__(self, reason: str):
+        super().__init__(f"[台账包无效] {reason}")

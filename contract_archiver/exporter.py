@@ -9,6 +9,7 @@ from typing import Iterable, Sequence
 
 from .storage import BatchInfo, IssueRecord, STATE_LABELS, FilterScheme
 from .storage import BatchDiffResult, DiffIssueRecord, DIFF_TYPE_LABELS
+from .storage import LedgerInfo, LedgerRecord, LEDGER_PROGRESS_LABELS, LEDGER_PRIORITY_LABELS
 
 
 STATE_CLASS = {
@@ -591,6 +592,213 @@ td.message {{ max-width: 400px; }}
 </thead>
 <tbody>
 {''.join(all_rows) if all_rows else '<tr><td colspan="12" class="muted">无差异</td></tr>'}
+</tbody>
+</table>
+
+<div class="footer">报告生成时间: {html.escape(now)}</div>
+</body>
+</html>"""
+
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(html_content)
+    return out
+
+
+PRIORITY_CLASS = {
+    "high": "prio-high",
+    "medium": "prio-medium",
+    "low": "prio-low",
+}
+
+PROGRESS_CLASS = {
+    "pending": "prog-pending",
+    "in_progress": "prog-in-progress",
+    "submitted": "prog-submitted",
+    "confirmed": "prog-confirmed",
+    "closed": "prog-closed",
+}
+
+
+def export_ledger_csv(
+    ledger: LedgerInfo,
+    records: list[LedgerRecord],
+    output_path: str | os.PathLike,
+) -> Path:
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(out, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "台账名", "批次ID",
+            "记录ID", "问题ID",
+            "项目名称", "项目类型",
+            "问题类型", "严重程度",
+            "规则名", "文件路径",
+            "问题描述",
+            "负责人", "截止日期", "优先级",
+            "沟通备注", "进度",
+            "创建时间", "更新时间",
+            "导入来源",
+        ])
+        for r in records:
+            writer.writerow([
+                ledger.name,
+                r.batch_id,
+                r.id,
+                r.issue_id,
+                r.project_name,
+                r.project_type_id or "",
+                r.issue_type,
+                r.severity,
+                r.rule_name or "",
+                r.file_path or "",
+                r.message,
+                r.responsible_person or "",
+                r.deadline or "",
+                r.priority_label,
+                r.communication_notes or "",
+                r.progress_label,
+                r.created_at,
+                r.updated_at,
+                r.import_source or "",
+            ])
+
+    return out
+
+
+def export_ledger_html(
+    ledger: LedgerInfo,
+    records: list[LedgerRecord],
+    output_path: str | os.PathLike,
+) -> Path:
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    total = len(records)
+    overdue = sum(1 for r in records if r.is_overdue)
+    high_priority = sum(1 for r in records if r.priority == "high")
+    pending = sum(1 for r in records if r.progress == "pending")
+    in_progress = sum(1 for r in records if r.progress == "in_progress")
+    closed = sum(1 for r in records if r.progress == "closed")
+
+    grouped: dict[str, list[LedgerRecord]] = {}
+    for r in records:
+        grouped.setdefault(r.responsible_person or "(未指定)", []).append(r)
+
+    responsible_summary = []
+    for person in sorted(grouped.keys()):
+        person_records = grouped[person]
+        person_overdue = sum(1 for r in person_records if r.is_overdue)
+        person_open = sum(1 for r in person_records if r.progress not in ("confirmed", "closed"))
+        responsible_summary.append(
+            f'<div class="card">'
+            f'<strong>{html.escape(person)}</strong>'
+            f'<span>{len(person_records)} 条 | 进行中 {person_open} | 逾期 {person_overdue}</span>'
+            f'</div>'
+        )
+
+    rows_html = []
+    for r in records:
+        prio_cls = PRIORITY_CLASS.get(r.priority, "")
+        prog_cls = PROGRESS_CLASS.get(r.progress, "")
+        overdue_html = ' <span class="overdue-tag">⚠逾期</span>' if r.is_overdue else ""
+        rows_html.append(
+            f"<tr>"
+            f"<td>{r.id}</td>"
+            f"<td>{html.escape(r.project_name)}</td>"
+            f'<td><span class="{prio_cls}">{html.escape(r.priority_label)}</span></td>'
+            f'<td><span class="progress-tag {prog_cls}">{html.escape(r.progress_label)}</span>{overdue_html}</td>'
+            f"<td>{html.escape(r.responsible_person or '')}</td>"
+            f"<td>{html.escape(r.deadline or '')}</td>"
+            f"<td>{html.escape(r.rule_name or '')}</td>"
+            f'<td class="message">{html.escape(r.message)}</td>'
+            f"<td>{html.escape(r.communication_notes or '')}</td>"
+            f"</tr>"
+        )
+
+    responsible_cards = "\n".join(responsible_summary)
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>补交跟踪台账 - {html.escape(ledger.name)}</title>
+<style>
+body {{ font-family: "Microsoft YaHei", "PingFang SC", sans-serif; margin: 24px; color: #333; }}
+h1 {{ margin-bottom: 8px; }}
+h2 {{ margin-top: 32px; border-bottom: 2px solid #333; padding-bottom: 6px; }}
+.meta {{ color: #666; margin-bottom: 24px; font-size: 14px; }}
+.summary {{ display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; }}
+.card {{ padding: 12px 20px; border-radius: 6px; background: #f5f5f5; min-width: 120px; }}
+.card strong {{ display: block; font-size: 24px; }}
+.card span {{ font-size: 13px; color: #666; }}
+.card.overdue {{ background: #ffebee; }}
+.card.high {{ background: #fff3e0; }}
+.card.pending-card {{ background: #e3f2fd; }}
+.card.progress-card {{ background: #e8f5e9; }}
+.card.closed-card {{ background: #f3e5f5; }}
+table {{ border-collapse: collapse; width: 100%; font-size: 14px; }}
+th, td {{ padding: 8px 10px; text-align: left; border: 1px solid #ddd; vertical-align: top; }}
+th {{ background: #f0f0f0; position: sticky; top: 0; }}
+tr:hover td {{ background: #fafafa; }}
+td.message {{ max-width: 400px; }}
+.prio-high {{ color: #c62828; font-weight: bold; }}
+.prio-medium {{ color: #ef6c00; font-weight: bold; }}
+.prio-low {{ color: #2e7d32; }}
+.progress-tag {{ display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 12px; font-weight: bold; }}
+.prog-pending {{ background: #ffeb3b; color: #5d4037; }}
+.prog-in-progress {{ background: #2196f3; color: #fff; }}
+.prog-submitted {{ background: #ff9800; color: #fff; }}
+.prog-confirmed {{ background: #4caf50; color: #fff; }}
+.prog-closed {{ background: #9e9e9e; color: #fff; }}
+.overdue-tag {{ background: #f44336; color: #fff; padding: 1px 6px; border-radius: 3px; font-size: 11px; font-weight: bold; margin-left: 4px; }}
+.muted {{ color: #999; font-weight: normal; }}
+.footer {{ margin-top: 32px; color: #999; font-size: 12px; }}
+</style>
+</head>
+<body>
+<h1>补交跟踪台账</h1>
+<div class="meta">
+台账名: <strong>{html.escape(ledger.name)}</strong> &nbsp;|&nbsp;
+批次ID: <code>{html.escape(ledger.batch_id)}</code> &nbsp;|&nbsp;
+更新时间: {html.escape(ledger.updated_at)}
+</div>
+
+<h2>汇总</h2>
+<div class="summary">
+  <div class="card"><strong>{total}</strong><span>待办总数</span></div>
+  <div class="card overdue"><strong>{overdue}</strong><span>逾期</span></div>
+  <div class="card high"><strong>{high_priority}</strong><span>高优先级</span></div>
+  <div class="card pending-card"><strong>{pending}</strong><span>待处理</span></div>
+  <div class="card progress-card"><strong>{in_progress}</strong><span>跟进中</span></div>
+  <div class="card closed-card"><strong>{closed}</strong><span>已关闭</span></div>
+</div>
+
+<h2>按负责人</h2>
+<div class="summary">
+{responsible_cards}
+</div>
+
+<h2>待办明细</h2>
+<table>
+<thead>
+<tr>
+  <th>ID</th>
+  <th>项目</th>
+  <th>优先级</th>
+  <th>进度</th>
+  <th>负责人</th>
+  <th>截止日期</th>
+  <th>规则名</th>
+  <th>问题描述</th>
+  <th>沟通备注</th>
+</tr>
+</thead>
+<tbody>
+{''.join(rows_html) if rows_html else '<tr><td colspan="9" class="muted">暂无待办记录</td></tr>'}
 </tbody>
 </table>
 

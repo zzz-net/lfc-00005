@@ -13,6 +13,9 @@
 - **筛选方案**：将常用的批次/状态/严重度/项目类型组合保存为命名方案，一键复用；方案条件写入导出报告，线下流转可对口径
 - **方案迁移包**：`scheme export` / `scheme import` 导出/导入 JSON 迁移包，法务把常用筛选口径从一台电脑带到另一台；同名方案默认跳过有摘要，`--overwrite` 覆盖；覆盖后可用 `scheme undo` 回退；全链路写审计日志（含来源文件）
 - **工作包交接**：`workpack export` / `workpack import` 把整个批次（含问题列表、处理状态、备注、撤销历史摘要、相关筛选方案、规则配置摘要）导出为 JSON 工作包，交给同事在另一台电脑继续处理；同名批次/方案/状态冲突默认跳过并给出清晰提示，提供 `--overwrite-batch`/`--overwrite-state`/`--overwrite-scheme` 显式覆盖参数；导入后可 `workpack undo` 回退，导入来源写入 CSV/HTML 报告
+- **补交跟踪台账**：`ledger create` 从批次或筛选方案生成待办清单，每条记录包含负责人、截止日期、优先级、沟通备注和进度；`ledger list` 支持按负责人、逾期、项目类型查询；台账数据 SQLite 持久化，重启后继续可查
+- **台账配置**：`ledger config` 设置默认截止天数、优先级规则、负责人映射；配置缺失或写错有清晰提示
+- **台账导入导出**：`ledger export-pkg` / `ledger import` 导出/导入 JSON 台账包，可跨机器跟进；同名台账、指纹重复待办、负责人映射不一致等冲突默认跳过，提供 `--overwrite-ledger`/`--overwrite-record`/`--ignore-responsible-mismatch` 显式覆盖；所有操作写审计日志，支持撤销
 - **报告导出**：CSV（UTF-8 BOM，Excel 友好）和 HTML（带汇总卡片、颜色分组、导入来源标识）
 - **错误反馈**：配置写错、目录不存在、空撤销、重复扫描、无效参数均有明确可验证提示
 
@@ -287,6 +290,11 @@ python -m contract_archiver scheme export --help
 python -m contract_archiver scheme import --help
 python -m contract_archiver scheme undo --help
 python -m contract_archiver scheme audit --help
+python -m contract_archiver workpack --help
+python -m contract_archiver workpack export --help
+python -m contract_archiver workpack import --help
+python -m contract_archiver workpack undo --help
+python -m contract_archiver workpack log --help
 python -m contract_archiver mark --help
 python -m contract_archiver undo --help
 python -m contract_archiver export --help

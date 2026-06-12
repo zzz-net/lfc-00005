@@ -1,0 +1,5 @@
+﻿project_types:
+  - type_id: SALES
+    attachments:
+      - name: 主合同
+        naming_pattern: "["

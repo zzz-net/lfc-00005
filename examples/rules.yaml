@@ -1,0 +1,60 @@
+# 合同附件归档校验规则示例
+# 支持 YAML 或 JSON 格式
+
+global_max_size_kb: 51200  # 全局单文件大小上限 50MB
+
+ignore_patterns:
+  - "^~\\$"            # 忽略 Office 临时文件
+  - "\\.tmp$"          # 忽略临时文件
+  - "\\.bak$"          # 忽略备份文件
+  - "Thumbs\\.db"      # 忽略 Windows 缩略图缓存
+  - "desktop\\.ini"    # 忽略 Windows 桌面配置
+
+project_types:
+  - type_id: SALES
+    display_name: 销售合同
+    directory_pattern: "销售|SALES|sales"
+    attachments:
+      - name: 主合同
+        required: true
+        naming_pattern: ".*销售合同.*(v\\d+|最终版|V\\d+)"
+        version_priority: ["最终版", "v3", "v2", "v1"]
+        max_size_kb: 20480
+      - name: 营业执照
+        required: true
+        naming_pattern: ".*营业执照.*"
+      - name: 法人身份证
+        required: true
+        naming_pattern: ".*法人.*身份证.*"
+      - name: 授权委托书
+        required: false
+        naming_pattern: ".*授权委托.*"
+      - name: 报价单
+        required: false
+        naming_pattern: ".*报价.*"
+
+  - type_id: PURCHASE
+    display_name: 采购合同
+    directory_pattern: "采购|PURCHASE|purchase"
+    attachments:
+      - name: 主合同
+        required: true
+        naming_pattern: ".*采购合同.*(v\\d+|最终版|V\\d+)"
+        version_priority: ["最终版", "v3", "v2", "v1"]
+      - name: 供应商资质
+        required: true
+        naming_pattern: ".*资质.*|.*营业执照.*"
+      - name: 报价单
+        required: true
+        naming_pattern: ".*报价.*"
+      - name: 验收单
+        required: false
+        naming_pattern: ".*验收.*"
+
+  - type_id: NDA
+    display_name: 保密协议
+    directory_pattern: "保密|NDA|nda"
+    attachments:
+      - name: 保密协议
+        required: true
+        naming_pattern: ".*保密.*|.*NDA.*"

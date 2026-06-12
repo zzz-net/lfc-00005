@@ -1,0 +1,34 @@
+{
+  "global_max_size_kb": 51200,
+  "ignore_patterns": [
+    "^~$",
+    "\\.tmp$",
+    "Thumbs\\.db"
+  ],
+  "project_types": [
+    {
+      "type_id": "SALES",
+      "display_name": "销售合同",
+      "directory_pattern": "销售|SALES|sales",
+      "attachments": [
+        {
+          "name": "主合同",
+          "required": true,
+          "naming_pattern": ".*销售合同.*(v\\d+|最终版|V\\d+)",
+          "version_priority": ["最终版", "v3", "v2", "v1"],
+          "max_size_kb": 20480
+        },
+        {
+          "name": "营业执照",
+          "required": true,
+          "naming_pattern": ".*营业执照.*"
+        },
+        {
+          "name": "法人身份证",
+          "required": true,
+          "naming_pattern": ".*法人.*身份证.*"
+        }
+      ]
+    }
+  ]
+}

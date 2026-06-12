@@ -26,6 +26,11 @@ VALID_STATES = {"pending", "passed", "ignored"}
 STATE_LABELS = {"pending": "待补", "passed": "通过", "ignored": "忽略"}
 
 
+def _is_permission_error(exc: sqlite3.OperationalError) -> bool:
+    msg = str(exc).lower()
+    return "readonly" in msg or "read-only" in msg or "permission" in msg
+
+
 def _validate_state(state: str) -> str:
     s = state.lower()
     if s not in VALID_STATES:
@@ -130,7 +135,7 @@ class Storage:
         try:
             conn = sqlite3.connect(str(self.db_path))
         except sqlite3.OperationalError as e:
-            if "permission" in str(e).lower() or "unable to open" in str(e).lower():
+            if _is_permission_error(e):
                 raise DatabasePermissionError(str(self.db_path), "连接") from e
             raise
         conn.row_factory = sqlite3.Row
@@ -145,9 +150,16 @@ class Storage:
             try:
                 conn.commit()
             except sqlite3.OperationalError as e:
-                if "readonly" in str(e).lower() or "permission" in str(e).lower():
+                if _is_permission_error(e):
                     raise DatabasePermissionError(str(self.db_path), "写入") from e
                 raise
+        except DatabasePermissionError:
+            raise
+        except sqlite3.OperationalError as e:
+            conn.rollback()
+            if _is_permission_error(e):
+                raise DatabasePermissionError(str(self.db_path), "写入") from e
+            raise
         except Exception:
             conn.rollback()
             raise

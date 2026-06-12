@@ -562,24 +562,81 @@ def _extract_issue_count(list_output: str) -> int:
         line = line.strip()
         if line.startswith("共 ") and line.endswith(" 条记录"):
             return int(line.split()[1])
-    # 如果列表里只有 "(无匹配问题...)" 之类的
     if "无问题记录" in list_output or "无匹配问题" in list_output:
         return 0
-    # 回退：数非表头的表格行数
     count = 0
     for line in list_output.splitlines():
         stripped = line.strip()
         if not stripped:
             continue
-        # 判断是否以数字开头（ID 列）
         first_part = stripped.split()[0] if stripped.split() else ""
         try:
             int(first_part)
             count += 1
         except (ValueError, IndexError):
-            # 表头行 ID 会失败
             continue
     return count
+
+
+def test_readonly_db_scheme_save(tmp_db: Path):
+    """测试6: 只读数据库下 scheme save 应返回清晰的中文权限提示，而非原始 traceback"""
+    import stat
+    from contract_archiver.exceptions import DatabasePermissionError
+
+    print("=" * 60)
+    print("测试6: 只读数据库 scheme save 权限提示")
+
+    # 先用正常权限创建数据库和表
+    storage = Storage(tmp_db)
+    storage.save_scheme(name="已有的方案", severity="error")
+    del storage
+
+    import gc
+    gc.collect()
+
+    # 设置文件为只读
+    tmp_db.chmod(tmp_db.stat().st_mode & ~stat.S_IWUSR & ~stat.S_IWGRP & ~stat.S_IWOTH)
+    print(f"  已将数据库设为只读: {tmp_db}")
+
+    try:
+        # 测试 Storage API 层面
+        readonly_storage = Storage(tmp_db)
+        try:
+            readonly_storage.save_scheme(name="只读测试方案", state="pending")
+            raise AssertionError("只读数据库应该报错")
+        except DatabasePermissionError as e:
+            assert "数据库权限错误" in str(e), f"权限提示不正确: {e}"
+            assert "写入" in str(e), f"提示应包含'写入': {e}"
+            assert str(tmp_db) in str(e), f"提示应包含数据库路径: {e}"
+            # 确保不是原始 OperationalError traceback
+            assert "sqlite3.OperationalError" not in str(e)
+            assert "attempt to write" not in str(e).lower()
+            print(f"  Storage API 层: {e}")
+            print("  ✓ Storage API 层返回清晰的 DatabasePermissionError")
+        finally:
+            del readonly_storage
+            gc.collect()
+
+        # 测试 CLI 层面
+        rc, out, err = run_cli(
+            "--db", str(tmp_db),
+            "scheme", "save", "CLI只读测试",
+            "--state", "pending",
+        )
+        assert rc != 0, f"只读数据库 scheme save 退出码应为非0, 实际={rc}"
+        assert "数据库权限错误" in err, f"stderr 应含'数据库权限错误', 实际: {err}"
+        assert "写入" in err, f"stderr 应含'写入', 实际: {err}"
+        assert "sqlite3.OperationalError" not in err, f"不应暴露原始异常类名: {err}"
+        assert "attempt to write" not in err.lower(), f"不应暴露英文原始错误: {err}"
+        assert "Traceback" not in err, f"不应暴露 traceback: {err}"
+        print(f"  CLI 层: rc={rc}, stderr={err.strip()}")
+        print("  ✓ CLI 层返回清晰的中文权限提示（无 traceback）")
+
+    finally:
+        # 恢复写权限以便清理
+        tmp_db.chmod(tmp_db.stat().st_mode | stat.S_IWUSR)
+
+    print("测试6: 通过 ✓\n")
 
 
 def main_tests():
@@ -604,6 +661,7 @@ def main_tests():
         ("test_scheme_conflict_and_overwrite", lambda d: test_scheme_conflict_and_overwrite(d)),
         ("test_scheme_empty_and_notfound", lambda d: test_scheme_empty_and_notfound(d)),
         ("test_export_fields", lambda d: test_export_fields(d, rules_file, sample_dir)),
+        ("test_readonly_db_scheme_save", lambda d: test_readonly_db_scheme_save(d)),
     ]
 
     for name, test_fn in tests:

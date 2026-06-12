@@ -152,7 +152,34 @@ python -m contract_archiver scheme show 法务-待补错误
 
 # 删除方案
 python -m contract_archiver scheme delete 采购类问题
+
+# 导出所有方案为迁移包（JSON，拷到U盘带到另一台电脑）
+python -m contract_archiver scheme export -o 法务常用方案.json
+
+# 导出单个或多个指定方案
+python -m contract_archiver scheme export 法务-待补错误 采购类问题 -o 常用_两个.json
+
+# 导入迁移包（目标库已有同名时默认跳过，摘要里列出来）
+python -m contract_archiver scheme import 法务常用方案.json
+
+# 导入时覆盖同名方案（不加 --overwrite 同名跳过；加了才覆盖）
+python -m contract_archiver scheme import 法务常用方案.json --overwrite
+
+# 查看方案操作审计日志（导入/跳过/覆盖/删除/撤销都可追溯，含来源文件）
+python -m contract_archiver scheme audit
+
+# 撤销最近一次方案覆盖（覆盖导入后可回退，还原所有条件+时间戳）
+python -m contract_archiver scheme undo
+
+# 撤销指定方案名的最近一次覆盖
+python -m contract_archiver scheme undo 法务-待补错误
 ```
+
+**迁移包关键规则**：
+- 迁移 JSON 保留 8 个字段：`方案名`、`筛选条件`（批次/状态/严重度/项目类型）、`version` 版本号、`创建时间`、`更新时间`
+- **同名默认跳过**：导入时遇到同名方案默认跳过，输出中文摘要；加 `--overwrite` 才覆盖
+- **覆盖后可撤销**：`scheme undo` 可回退最近一次覆盖，完整还原方案的所有条件和时间戳
+- **全链路审计**：`scheme audit` 可追溯所有方案操作，含迁移包来源文件路径
 
 **完整示例**：扫描示例数据 → 保存方案 → 套用方案查看 → 按方案导出
 
@@ -253,6 +280,10 @@ python -m contract_archiver --help
 python -m contract_archiver scan --help
 python -m contract_archiver list --help
 python -m contract_archiver scheme --help
+python -m contract_archiver scheme export --help
+python -m contract_archiver scheme import --help
+python -m contract_archiver scheme undo --help
+python -m contract_archiver scheme audit --help
 python -m contract_archiver mark --help
 python -m contract_archiver undo --help
 python -m contract_archiver export --help

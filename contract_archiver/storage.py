@@ -59,6 +59,17 @@ from .exceptions import (
     InvalidSnapshotPackageError,
     SnapshotImportConflictError,
 )
+from ._pkg_utils import (
+    load_package_file,
+    validate_package_type,
+    validate_package_version,
+    validate_required_fields,
+    validate_list_field,
+    validate_list_items,
+    write_package_to_file,
+    log_audit,
+    save_undo,
+)
 from . import __version__ as PACKAGE_VERSION
 from .scanner import IssueSeverity, IssueType, ScanIssue, ScanResult, ProjectScanResult
 
@@ -1451,32 +1462,21 @@ class Storage:
 
     def export_schemes_to_file(self, output_path: str | os.PathLike, names: list[str] | None = None) -> Path:
         pkg = self.export_schemes(names)
-        out = Path(output_path)
-        out.write_text(json.dumps(pkg, ensure_ascii=False, indent=2), encoding="utf-8")
-        return out
+        return write_package_to_file(pkg, output_path, io_exc=MigrationPackageParseError)
 
     @staticmethod
     def _load_migration_package(file_path: str | os.PathLike) -> dict[str, Any]:
-        fp = Path(file_path)
-        abs_path = str(fp.resolve())
-        raw = fp.read_text(encoding="utf-8")
-        if not raw.strip():
-            raise MigrationPackageEmptyError(abs_path)
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError as e:
-            raise MigrationPackageParseError(abs_path, f"JSON 格式错误: {e.msg} (行{e.lineno}, 列{e.colno})") from e
-        if not isinstance(data, dict):
-            raise InvalidMigrationPackageError(f"文件 {abs_path} 顶层结构应为 JSON 对象，实际是 {type(data).__name__}")
-        if "schemes" not in data:
-            raise MigrationPackageMissingFieldError(abs_path, "schemes")
-        if not isinstance(data["schemes"], list):
-            raise InvalidMigrationPackageError(f"文件 {abs_path} 的 'schemes' 字段应为数组")
-        if not data["schemes"]:
-            raise MigrationPackageEmptyError(abs_path)
+        abs_path, _raw, data = load_package_file(
+            file_path,
+            empty_exc=MigrationPackageEmptyError,
+            parse_exc=MigrationPackageParseError,
+            missing_exc=MigrationPackageMissingFieldError,
+        )
+        validate_required_fields(data, abs_path, ["schemes"], MigrationPackageMissingFieldError)
+        schemes = validate_list_field(data, abs_path, "schemes", MigrationPackageParseError, MigrationPackageEmptyError)
         required_fields = {"name", "created_at", "updated_at", "version"}
         optional_any = {"batch_id", "state", "severity", "project_type_id"}
-        for idx, s in enumerate(data["schemes"]):
+        for idx, s in enumerate(schemes):
             if not isinstance(s, dict):
                 raise InvalidMigrationPackageError(
                     f"文件 {abs_path} 第{idx + 1}个方案不是 JSON 对象"
@@ -1495,22 +1495,10 @@ class Storage:
                 )
         return data
 
-    def _log_scheme_audit(
-        self,
-        conn: sqlite3.Connection,
-        action: str,
-        scheme_name: str,
-        result: str,
-        source_file: str | None = None,
-        detail: str | None = None,
-    ) -> None:
-        now = datetime.now().isoformat(timespec="seconds")
-        conn.execute(
-            """INSERT INTO scheme_audit_log
-            (action, scheme_name, source_file, result, detail, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)""",
-            (action, scheme_name, source_file, result, detail, now),
-        )
+    def _log_scheme_audit(self, conn, action, scheme_name, result, source_file=None, detail=None):
+        log_audit(conn, "scheme_audit_log", "scheme_name", scheme_name, action,
+                  detail=detail or result, source_file=source_file,
+                  extra_fields={"result": result})
 
     def import_schemes(
         self,
@@ -1873,59 +1861,25 @@ class Storage:
 
         return self._make_work_package(batch, issues, rule_summary, undo_summary, schemes)
 
-    def export_work_package_to_file(
-        self,
-        batch_id: str,
-        output_path: str | os.PathLike,
-    ) -> Path:
+    def export_work_package_to_file(self, batch_id: str, output_path: str | os.PathLike) -> Path:
         pkg = self.export_work_package(batch_id)
-        out = Path(output_path)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(pkg, ensure_ascii=False, indent=2), encoding="utf-8")
-        return out
+        return write_package_to_file(pkg, output_path, io_exc=WorkPackageError)
 
     @staticmethod
     def _load_work_package(file_path: str | os.PathLike) -> dict[str, Any]:
-        fp = Path(file_path)
-        abs_path = str(fp.resolve())
-        raw = fp.read_text(encoding="utf-8")
-        if not raw.strip():
-            raise WorkPackageEmptyError(abs_path)
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError as e:
-            raise WorkPackageParseError(abs_path, f"JSON 格式错误: {e.msg} (行{e.lineno}, 列{e.colno})") from e
-        if not isinstance(data, dict):
-            raise InvalidWorkPackageError(f"文件 {abs_path} 顶层结构应为 JSON 对象，实际是 {type(data).__name__}")
-        if data.get("package_type") != "work_package":
-            raise InvalidWorkPackageError(f"文件 {abs_path} 不是有效的工作包（缺少 package_type=work_package）")
-
-        required_top = {"batch", "issues", "package_version"}
-        for fld in required_top:
-            if fld not in data:
-                raise WorkPackageMissingFieldError(abs_path, fld)
-
-        batch_required = {"batch_id", "scan_path", "scanned_at"}
-        for fld in batch_required:
-            if fld not in data["batch"]:
-                raise WorkPackageMissingFieldError(abs_path, fld, "batch")
-
-        if not isinstance(data["issues"], list):
-            raise InvalidWorkPackageError(f"文件 {abs_path} 的 'issues' 字段应为数组")
-        if not data["issues"]:
-            raise WorkPackageEmptyError(abs_path)
-
-        issue_required = {"project_path", "project_name", "issue_type", "severity", "message"}
-        for idx, issue in enumerate(data["issues"]):
-            if not isinstance(issue, dict):
-                raise InvalidWorkPackageError(f"文件 {abs_path} 第{idx + 1}个问题不是 JSON 对象")
-            for fld in issue_required:
-                if fld not in issue:
-                    raise WorkPackageMissingFieldError(abs_path, fld, f"issues[{idx}]")
-
+        abs_path, _raw, data = load_package_file(
+            file_path,
+            empty_exc=WorkPackageEmptyError,
+            parse_exc=WorkPackageParseError,
+            missing_exc=WorkPackageMissingFieldError,
+        )
+        validate_package_type(data, abs_path, "work_package", WorkPackageParseError)
+        validate_required_fields(data, abs_path, ["batch", "issues", "package_version"], WorkPackageMissingFieldError)
+        validate_required_fields(data["batch"], abs_path, ["batch_id", "scan_path", "scanned_at"], WorkPackageMissingFieldError, "batch")
+        validate_list_field(data, abs_path, "issues", WorkPackageParseError, WorkPackageEmptyError)
+        validate_list_items(data["issues"], abs_path, {"project_path", "project_name", "issue_type", "severity", "message"}, WorkPackageParseError, WorkPackageMissingFieldError, "issues")
         if "schemes" in data and not isinstance(data["schemes"], list):
             raise InvalidWorkPackageError(f"文件 {abs_path} 的 'schemes' 字段应为数组")
-
         return data
 
     def import_work_package(
@@ -2414,21 +2368,9 @@ class Storage:
             updated_at=r["updated_at"] or now_iso,
         )
 
-    def _log_ledger_audit(
-        self,
-        conn: sqlite3.Connection,
-        ledger_name: str,
-        action: str,
-        detail: str | None = None,
-        source_file: str | None = None,
-    ) -> None:
-        now = datetime.now().isoformat(timespec="seconds")
-        conn.execute(
-            """INSERT INTO ledger_audit_log
-            (ledger_name, action, detail, source_file, created_at)
-            VALUES (?, ?, ?, ?, ?)""",
-            (ledger_name, action, detail, source_file, now),
-        )
+    def _log_ledger_audit(self, conn, ledger_name, action, detail=None, source_file=None):
+        log_audit(conn, "ledger_audit_log", "ledger_name", ledger_name, action,
+                  detail=detail, source_file=source_file)
 
     def create_ledger(
         self,
@@ -2911,10 +2853,7 @@ class Storage:
 
     def export_ledger_package_to_file(self, name: str, output_path: str | os.PathLike) -> Path:
         pkg = self.export_ledger_package(name)
-        out = Path(output_path)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(pkg, ensure_ascii=False, indent=2), encoding="utf-8")
-        return out
+        return write_package_to_file(pkg, output_path, io_exc=LedgerPackageError)
 
     def import_ledger_package(
         self,
@@ -2923,35 +2862,19 @@ class Storage:
         overwrite_record: bool = False,
         ignore_responsible_mismatch: bool = False,
     ) -> dict[str, Any]:
+        abs_path, _raw, data = load_package_file(
+            file_path,
+            empty_exc=LedgerPackageEmptyError,
+            parse_exc=LedgerPackageParseError,
+            missing_exc=LedgerPackageMissingFieldError,
+        )
         fp = Path(file_path)
-        abs_path = str(fp.resolve())
-        raw = fp.read_text(encoding="utf-8")
-        if not raw.strip():
-            raise LedgerPackageEmptyError(abs_path)
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError as e:
-            raise LedgerPackageParseError(abs_path, f"JSON 格式错误: {e.msg} (行{e.lineno}, 列{e.colno})") from e
-
-        if not isinstance(data, dict):
-            raise InvalidLedgerPackageError(f"文件 {abs_path} 顶层结构应为 JSON 对象")
-        if data.get("package_type") != "ledger_package":
-            raise InvalidLedgerPackageError(f"文件 {abs_path} 不是有效的台账包（缺少 package_type=ledger_package）")
-
-        for fld in ("ledger", "records"):
-            if fld not in data:
-                raise LedgerPackageMissingFieldError(abs_path, fld)
-
-        ledger_data = data["ledger"]
-        for fld in ("name", "batch_id"):
-            if fld not in ledger_data:
-                raise LedgerPackageMissingFieldError(abs_path, fld, "ledger")
-
-        records_data = data["records"]
-        if not isinstance(records_data, list):
-            raise InvalidLedgerPackageError(f"文件 {abs_path} 的 'records' 字段应为数组")
-
+        validate_package_type(data, abs_path, "ledger_package", InvalidLedgerPackageError)
+        validate_required_fields(data, abs_path, ["ledger", "records"], LedgerPackageMissingFieldError)
+        validate_required_fields(data["ledger"], abs_path, ["name", "batch_id"], LedgerPackageMissingFieldError, "ledger")
+        records_data = validate_list_field(data, abs_path, "records", LedgerPackageParseError, required=False)
         config_data = data.get("config", {})
+        ledger_data = data["ledger"]
         ledger_name = ledger_data["name"].strip()
         batch_id = ledger_data["batch_id"]
 
@@ -3193,21 +3116,9 @@ class Storage:
             rows = conn.execute(sql, params).fetchall()
             return [dict(r) for r in rows]
 
-    def _log_snapshot_audit(
-        self,
-        conn: sqlite3.Connection,
-        snapshot_name: str,
-        action: str,
-        detail: str | None = None,
-        source_file: str | None = None,
-    ) -> None:
-        now = datetime.now().isoformat(timespec="seconds")
-        conn.execute(
-            """INSERT INTO snapshot_audit_log
-            (snapshot_name, action, detail, source_file, created_at)
-            VALUES (?, ?, ?, ?, ?)""",
-            (snapshot_name, action, detail, source_file, now),
-        )
+    def _log_snapshot_audit(self, conn, snapshot_name, action, detail=None, source_file=None):
+        log_audit(conn, "snapshot_audit_log", "snapshot_name", snapshot_name, action,
+                  detail=detail, source_file=source_file)
 
     def _row_to_snapshot_file(self, r: sqlite3.Row) -> SnapshotFileRecord:
         return SnapshotFileRecord(
@@ -3315,16 +3226,11 @@ class Storage:
                 old_files = conn.execute(
                     "SELECT * FROM snapshot_files WHERE snapshot_name = ?", (name,)
                 ).fetchall()
-                old_data = json.dumps({
+                old_data = {
                     "snapshot": dict(old_rows) if old_rows else None,
                     "files": [dict(f) for f in old_files],
-                }, ensure_ascii=False)
-                conn.execute(
-                    """INSERT INTO snapshot_undo_log
-                    (snapshot_name, action, old_data, created_at)
-                    VALUES (?, ?, ?, ?)""",
-                    (name, "overwrite", old_data, now),
-                )
+                }
+                save_undo(conn, "snapshot_undo_log", "snapshot_name", name, "overwrite", old_data)
                 conn.execute("DELETE FROM snapshot_files WHERE snapshot_name = ?", (name,))
                 conn.execute("DELETE FROM snapshots WHERE name = ?", (name,))
                 result_action = "overwrite"
@@ -3491,17 +3397,11 @@ class Storage:
             old_files = conn.execute(
                 "SELECT * FROM snapshot_files WHERE snapshot_name = ?", (name,)
             ).fetchall()
-            old_data = json.dumps({
+            old_data = {
                 "snapshot": dict(old_rows) if old_rows else None,
                 "files": [dict(f) for f in old_files],
-            }, ensure_ascii=False)
-            now = datetime.now().isoformat(timespec="seconds")
-            conn.execute(
-                """INSERT INTO snapshot_undo_log
-                (snapshot_name, action, old_data, created_at)
-                VALUES (?, ?, ?, ?)""",
-                (name, "delete", old_data, now),
-            )
+            }
+            save_undo(conn, "snapshot_undo_log", "snapshot_name", name, "delete", old_data)
 
             self._log_snapshot_audit(
                 conn, name, "delete",
@@ -3541,114 +3441,28 @@ class Storage:
         files = self.get_snapshot_files(name)
         return self._make_snapshot_package(snapshot, files)
 
-    def export_snapshot_package_to_file(
-        self,
-        name: str,
-        output_path: str | os.PathLike,
-    ) -> Path:
-        import zipfile
+    def export_snapshot_package_to_file(self, name: str, output_path: str | os.PathLike) -> Path:
         pkg = self.export_snapshot_package(name)
-        out = Path(output_path)
-        try:
-            out.parent.mkdir(parents=True, exist_ok=True)
-
-            if out.suffix.lower() == ".zip":
-                json_name = out.stem + ".json"
-                with zipfile.ZipFile(
-                    str(out), "w",
-                    compression=zipfile.ZIP_DEFLATED,
-                    compresslevel=9,
-                ) as zf:
-                    zf.writestr(
-                        json_name,
-                        json.dumps(pkg, ensure_ascii=False, indent=2),
-                    )
-            else:
-                if not out.suffix:
-                    out = out.with_suffix(".json")
-                out.write_text(
-                    json.dumps(pkg, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-        except (OSError, PermissionError, FileNotFoundError, zipfile.BadZipFile) as e:
-            raise SnapshotPackageError(f"写入快照包失败: {e}") from e
-        return out
+        return write_package_to_file(pkg, output_path, io_exc=SnapshotPackageError)
 
     @staticmethod
     def _load_snapshot_package(file_path: str | os.PathLike) -> dict[str, Any]:
-        import zipfile
-        fp = Path(file_path)
-        abs_path = str(fp.resolve())
-
-        if not fp.exists():
-            raise SnapshotPackageError(f"快照包文件不存在: {abs_path}")
-
-        if fp.suffix.lower() == ".zip":
-            try:
-                with zipfile.ZipFile(str(fp), "r") as zf:
-                    names = zf.namelist()
-                    json_names = [n for n in names if n.lower().endswith(".json")]
-                    if not json_names:
-                        raise SnapshotPackageParseError(abs_path, "ZIP 压缩包内未找到 JSON 文件")
-                    json_name = json_names[0]
-                    with zf.open(json_name) as jf:
-                        raw = jf.read().decode("utf-8")
-            except FileNotFoundError as e:
-                raise SnapshotPackageError(f"快照包文件不存在: {abs_path}") from e
-            except zipfile.BadZipFile as e:
-                raise SnapshotPackageParseError(abs_path, f"无效的 ZIP 文件: {e}") from e
-        else:
-            try:
-                raw = fp.read_text(encoding="utf-8")
-            except FileNotFoundError as e:
-                raise SnapshotPackageError(f"快照包文件不存在: {abs_path}") from e
-
-        if not raw.strip():
-            raise SnapshotPackageEmptyError(abs_path)
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError as e:
-            raise SnapshotPackageParseError(abs_path, f"JSON 格式错误: {e.msg} (行{e.lineno}, 列{e.colno})") from e
-
-        if not isinstance(data, dict):
-            raise SnapshotPackageParseError(abs_path, f"顶层结构应为 JSON 对象，实际是 {type(data).__name__}")
-        if "package_type" not in data:
-            raise SnapshotPackageMissingFieldError(abs_path, "package_type")
-        if data["package_type"] != "evidence_snapshot":
-            raise SnapshotPackageParseError(abs_path, f"package_type 应为 'evidence_snapshot'，实际是 '{data['package_type']}'")
-
-        if "package_version" not in data:
-            raise SnapshotPackageMissingFieldError(abs_path, "package_version")
-        try:
-            version = int(data["package_version"])
-        except (TypeError, ValueError):
-            raise SnapshotPackageParseError(abs_path, f"package_version 必须是正整数，实际是 {data['package_version']!r}")
-        if version < 1 or version > 100:
-            raise SnapshotPackageError(f"无效的快照包 {abs_path}: 不支持的版本号 {version}")
-
-        for fld in ("snapshot", "files"):
-            if fld not in data:
-                raise SnapshotPackageMissingFieldError(abs_path, fld)
-
-        snap_data = data["snapshot"]
-        for fld in ("name", "created_at", "updated_at"):
-            if fld not in snap_data:
-                raise SnapshotPackageMissingFieldError(abs_path, fld, "snapshot")
-
-        files_data = data["files"]
-        if not isinstance(files_data, list):
-            raise SnapshotPackageParseError(abs_path, "'files' 字段应为数组")
-        if not files_data:
-            raise SnapshotPackageEmptyError(abs_path)
-
-        file_required = {"project_path", "project_name", "issue_type", "severity", "message", "state"}
-        for idx, f in enumerate(files_data):
-            if not isinstance(f, dict):
-                raise SnapshotPackageParseError(abs_path, f"第{idx + 1}条文件记录不是 JSON 对象")
-            for fld in file_required:
-                if fld not in f:
-                    raise SnapshotPackageMissingFieldError(abs_path, fld, f"files[{idx}]")
-
+        abs_path, _raw, data = load_package_file(
+            file_path,
+            empty_exc=SnapshotPackageEmptyError,
+            parse_exc=SnapshotPackageParseError,
+            missing_exc=SnapshotPackageMissingFieldError,
+            not_found_exc=SnapshotPackageError,
+        )
+        validate_package_type(data, abs_path, "evidence_snapshot", SnapshotPackageParseError, SnapshotPackageMissingFieldError)
+        validate_package_version(data, abs_path, SnapshotPackageParseError, SnapshotPackageError, SnapshotPackageMissingFieldError)
+        validate_required_fields(data, abs_path, ["snapshot", "files"], SnapshotPackageMissingFieldError)
+        validate_required_fields(data["snapshot"], abs_path, ["name", "created_at", "updated_at"], SnapshotPackageMissingFieldError, "snapshot")
+        validate_list_field(data, abs_path, "files", SnapshotPackageParseError, SnapshotPackageEmptyError)
+        validate_list_items(data["files"], abs_path, {"project_path", "project_name", "issue_type", "severity", "message", "state"}, SnapshotPackageParseError, SnapshotPackageMissingFieldError, "files")
+        snap_name = data["snapshot"]["name"]
+        if not isinstance(snap_name, str) or not snap_name.strip():
+            raise SnapshotPackageError(f"文件 {abs_path} 的快照名称为空")
         return data
 
     def import_snapshot_package(
@@ -3747,16 +3561,11 @@ class Storage:
                 ).fetchall()
                 old_snapshot_data = dict(old_row) if old_row else None
                 old_files_data_list = [dict(f) for f in old_files]
-                undo_data = json.dumps({
+                undo_data = {
                     "snapshot": old_snapshot_data,
                     "files": old_files_data_list,
-                }, ensure_ascii=False)
-                conn.execute(
-                    """INSERT INTO snapshot_undo_log
-                    (snapshot_name, action, old_data, created_at)
-                    VALUES (?, ?, ?, ?)""",
-                    (snapshot_name, "import_overwrite_snapshot", undo_data, now),
-                )
+                }
+                save_undo(conn, "snapshot_undo_log", "snapshot_name", snapshot_name, "import_overwrite_snapshot", undo_data)
                 conn.execute("DELETE FROM snapshot_files WHERE snapshot_name = ?", (snapshot_name,))
                 conn.execute("DELETE FROM snapshots WHERE name = ?", (snapshot_name,))
 

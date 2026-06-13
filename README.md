@@ -434,6 +434,15 @@ python -m contract_archiver ledger export-pkg --help
 python -m contract_archiver ledger import --help
 python -m contract_archiver ledger undo --help
 python -m contract_archiver ledger log --help
+python -m contract_archiver snapshot --help
+python -m contract_archiver snapshot create --help
+python -m contract_archiver snapshot list --help
+python -m contract_archiver snapshot show --help
+python -m contract_archiver snapshot delete --help
+python -m contract_archiver snapshot export --help
+python -m contract_archiver snapshot import --help
+python -m contract_archiver snapshot undo --help
+python -m contract_archiver snapshot audit --help
 ```
 
 ## 项目结构
@@ -446,13 +455,51 @@ lfc-00005/
 │   ├── cli.py               # 命令行解析与子命令调度
 │   ├── rules.py             # 规则加载与校验
 │   ├── scanner.py           # 目录扫描与问题识别
-│   ├── storage.py           # SQLite 持久化与撤销
+│   ├── storage.py           # SQLite 持久化与撤销（四大包类型入口）
+│   ├── _pkg_utils.py        # **通用包处理工具：包加载/字段校验/审计写入/导出文件/撤销备份**
 │   ├── exporter.py          # CSV / HTML 导出
-│   └── exceptions.py        # 自定义异常
+│   └── exceptions.py        # 自定义异常（含 18 种包类型专属异常）
 ├── examples/
 │   ├── rules.yaml           # YAML 规则示例
 │   ├── rules.json           # JSON 规则示例
 │   └── sample_data/         # 样例资料目录（含各种问题场景）
 ├── requirements.txt
+├── _snapshot_regression_test.py   # 证据快照包回归测试 (26条)
+├── _ledger_regression_test.py     # 补交台账包回归测试 (27条)
+├── _workpack_regression_test.py   # 工作包回归测试 (16条)
+├── _scheme_migration_test.py      # 方案迁移包回归测试 (10条)
 └── README.md
 ```
+
+## 内部架构（重构后）
+
+导入导出、冲突处理、审计日志、撤销恢复统一抽象为四层，各包类型入口保留差异化逻辑。
+
+```
+storage.py（入口层）
+  ├─ 方案迁移包：export_schemes / export_schemes_to_file / import_schemes / undo_last_scheme_change
+  ├─ 工作包：    export_work_package / export_work_package_to_file / import_work_package / undo_last_import
+  ├─ 台账包：    export_ledger_package / export_ledger_package_to_file / import_ledger_package / undo_last_ledger_action
+  └─ 证据快照包：export_snapshot_package / export_snapshot_package_to_file / import_snapshot_package / undo_last_snapshot_action
+
+          ↓ 调用（所有共同流程都抽离）
+
+_pkg_utils.py（通用工具层）
+  ├─ load_package_file()        # 统一处理 JSON/ZIP 加载、FileNotFound、JSON 解析错误
+  ├─ validate_package_type()    # package_type 校验（支持单参数/双参数异常类签名）
+  ├─ validate_package_version() # 版本号校验（正整数 + 范围检查）
+  ├─ validate_required_fields() # 必填字段检查（自动识别 2/3 参数异常类）
+  ├─ validate_list_field()      # 数组字段校验（required / empty 选项）
+  ├─ validate_list_items()      # 数组内每条记录的必填字段校验
+  ├─ write_package_to_file()    # 统一处理 JSON/ZIP 导出、父目录创建、IO 错误包装
+  ├─ log_audit()                # 统一审计日志 INSERT（支持 extra_fields 扩展）
+  ├─ save_undo()                # 统一撤销备份（INSERT xxx_undo_log + old_data JSON 序列化）
+  └─ _raise()                   # 异常智能构造（基于 inspect.signature 自动匹配参数）
+```
+
+**设计要点**：
+1. **异常签名不统一时自动适配**：`_raise()` 优先直接调用异常类，失败时用 `inspect.signature` 检测实际参数数量并适配。这样 `InvalidLedgerPackageError(reason)`（单参数）和 `SnapshotPackageParseError(file_path, detail)`（双参数）和 `SnapshotPackageMissingFieldError(file_path, field, section)`（三参数）都能从同一套通用工具抛出，而不需要改 SQLite 表结构。
+2. **包加载统一**：四种包都走 `load_package_file()` → `validate_*()`，区别只在于传入的 `expected_type` / `required_fields` / `required_item_fields`。
+3. **审计写入统一**：四个审计辅助方法 `_log_scheme_audit`、`_log_ledger_audit`、`_log_workpack_audit`、`_log_snapshot_audit` 都基于 `log_audit()`。
+4. **向后兼容**：所有旧 JSON/ZIP 包（无 `package_type` / `package_version` 字段的历史包）仍能导入。`_load_migration_package` 和 `_load_work_package` 对历史包保持宽松，不强制校验 `package_type`。
+5. **跨重启持久化不退化**：所有 SQLite 表结构保持不变，`undo_log` / `audit_log` 的列名和原格式一致。

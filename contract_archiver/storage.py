@@ -23,6 +23,7 @@ from .exceptions import (
     MigrationPackageParseError,
     InvalidMigrationPackageError,
     SchemeImportConflictError,
+    BatchNotFoundError,
     WorkPackageError,
     InvalidWorkPackageError,
     WorkPackageEmptyError,
@@ -46,6 +47,17 @@ from .exceptions import (
     LedgerPackageParseError,
     LedgerPackageMissingFieldError,
     InvalidLedgerPackageError,
+    SnapshotError,
+    SnapshotNotFoundError,
+    SnapshotExistsError,
+    SnapshotEmptyError,
+    EmptySnapshotUndoError,
+    SnapshotPackageError,
+    SnapshotPackageEmptyError,
+    SnapshotPackageParseError,
+    SnapshotPackageMissingFieldError,
+    InvalidSnapshotPackageError,
+    SnapshotImportConflictError,
 )
 from . import __version__ as PACKAGE_VERSION
 from .scanner import IssueSeverity, IssueType, ScanIssue, ScanResult, ProjectScanResult
@@ -401,6 +413,105 @@ class LedgerUndoRecord:
     created_at: str
 
 
+STATE_ORDER = {"pending": 0, "ignored": 1, "passed": 2}
+
+
+@dataclass
+class SnapshotFileRecord:
+    id: int
+    snapshot_name: str
+    project_path: str
+    project_name: str
+    project_type_id: str | None
+    issue_type: str
+    severity: str
+    rule_name: str | None
+    file_path: str | None
+    message: str
+    fingerprint: str | None
+    state: str
+    handler: str | None
+    note: str | None
+    updated_at: str | None
+    batch_id: str | None
+    audit_log_json: str | None = None
+
+    @property
+    def state_label(self) -> str:
+        return STATE_LABELS.get(self.state, self.state)
+
+    @property
+    def issue_label(self) -> str:
+        from .scanner import ISSUE_LABELS
+        return ISSUE_LABELS.get(IssueType(self.issue_type), self.issue_type)
+
+    @property
+    def severity_label(self) -> str:
+        return "错误" if self.severity == IssueSeverity.ERROR else "警告"
+
+    @property
+    def audit_log(self) -> list[dict[str, Any]]:
+        if not self.audit_log_json:
+            return []
+        try:
+            return json.loads(self.audit_log_json)
+        except (json.JSONDecodeError, TypeError):
+            return []
+
+    def to_migration_dict(self) -> dict[str, Any]:
+        return {
+            "project_path": self.project_path,
+            "project_name": self.project_name,
+            "project_type_id": self.project_type_id,
+            "issue_type": self.issue_type,
+            "severity": self.severity,
+            "rule_name": self.rule_name,
+            "file_path": self.file_path,
+            "message": self.message,
+            "fingerprint": self.fingerprint,
+            "state": self.state,
+            "handler": self.handler,
+            "note": self.note,
+            "updated_at": self.updated_at,
+            "batch_id": self.batch_id,
+            "audit_log": self.audit_log,
+        }
+
+
+@dataclass
+class SnapshotInfo:
+    name: str
+    source_batch_id: str | None
+    source_scheme_name: str | None
+    file_count: int = 0
+    pending_count: int = 0
+    passed_count: int = 0
+    ignored_count: int = 0
+    description: str | None = None
+    created_at: str = ""
+    updated_at: str = ""
+    import_source: str | None = None
+
+    def to_display_dict(self) -> dict[str, str]:
+        result: dict[str, str] = {}
+        if self.source_batch_id:
+            result["源批次"] = self.source_batch_id
+        if self.source_scheme_name:
+            result["源方案"] = self.source_scheme_name
+        if self.description:
+            result["描述"] = self.description
+        return result
+
+
+@dataclass
+class SnapshotUndoRecord:
+    id: int
+    snapshot_name: str
+    action: str
+    old_data: str
+    created_at: str
+
+
 class Storage:
     def __init__(self, db_path: str | os.PathLike = None):
         if db_path is None:
@@ -667,6 +778,60 @@ class Storage:
                     old_data TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS snapshots (
+                    name TEXT PRIMARY KEY,
+                    source_batch_id TEXT,
+                    source_scheme_name TEXT,
+                    description TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    import_source TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS snapshot_files (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    snapshot_name TEXT NOT NULL REFERENCES snapshots(name) ON DELETE CASCADE,
+                    project_path TEXT NOT NULL,
+                    project_name TEXT NOT NULL,
+                    project_type_id TEXT,
+                    issue_type TEXT NOT NULL,
+                    severity TEXT NOT NULL,
+                    rule_name TEXT,
+                    file_path TEXT,
+                    message TEXT NOT NULL,
+                    fingerprint TEXT,
+                    state TEXT NOT NULL,
+                    handler TEXT,
+                    note TEXT,
+                    updated_at TEXT,
+                    batch_id TEXT,
+                    audit_log_json TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_snapshot_files_name ON snapshot_files(snapshot_name);
+                CREATE INDEX IF NOT EXISTS idx_snapshot_files_fingerprint ON snapshot_files(fingerprint);
+
+                CREATE TABLE IF NOT EXISTS snapshot_audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    snapshot_name TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    detail TEXT,
+                    source_file TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_snapshot_audit_name ON snapshot_audit_log(snapshot_name);
+
+                CREATE TABLE IF NOT EXISTS snapshot_undo_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    snapshot_name TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    old_data TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_snapshot_undo_name ON snapshot_undo_log(snapshot_name);
                 """
             )
 
@@ -859,8 +1024,6 @@ class Storage:
         return None
 
     def compare_batches(self, batch_old_id: str, batch_new_id: str) -> BatchDiffResult:
-        from .exceptions import BatchNotFoundError
-
         batch_old = self.get_batch(batch_old_id)
         if batch_old is None:
             raise BatchNotFoundError(batch_old_id)
@@ -3025,6 +3188,843 @@ class Storage:
         if ledger_name:
             sql += " WHERE ledger_name = ?"
             params.append(ledger_name)
+        sql += " ORDER BY created_at ASC, id ASC"
+        with self._conn() as conn:
+            rows = conn.execute(sql, params).fetchall()
+            return [dict(r) for r in rows]
+
+    def _log_snapshot_audit(
+        self,
+        conn: sqlite3.Connection,
+        snapshot_name: str,
+        action: str,
+        detail: str | None = None,
+        source_file: str | None = None,
+    ) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        conn.execute(
+            """INSERT INTO snapshot_audit_log
+            (snapshot_name, action, detail, source_file, created_at)
+            VALUES (?, ?, ?, ?, ?)""",
+            (snapshot_name, action, detail, source_file, now),
+        )
+
+    def _row_to_snapshot_file(self, r: sqlite3.Row) -> SnapshotFileRecord:
+        return SnapshotFileRecord(
+            id=r["id"],
+            snapshot_name=r["snapshot_name"],
+            project_path=r["project_path"],
+            project_name=r["project_name"],
+            project_type_id=r["project_type_id"],
+            issue_type=r["issue_type"],
+            severity=r["severity"],
+            rule_name=r["rule_name"],
+            file_path=r["file_path"],
+            message=r["message"],
+            fingerprint=r["fingerprint"],
+            state=r["state"],
+            handler=r["handler"],
+            note=r["note"],
+            updated_at=r["updated_at"],
+            batch_id=r["batch_id"],
+            audit_log_json=r["audit_log_json"],
+        )
+
+    def _build_snapshot_info(self, r: sqlite3.Row) -> SnapshotInfo:
+        return SnapshotInfo(
+            name=r["name"],
+            source_batch_id=r["source_batch_id"],
+            source_scheme_name=r["source_scheme_name"],
+            file_count=r["file_count"] or 0,
+            pending_count=r["pending_count"] or 0,
+            passed_count=r["passed_count"] or 0,
+            ignored_count=r["ignored_count"] or 0,
+            description=r["description"],
+            created_at=r["created_at"] or "",
+            updated_at=r["updated_at"] or "",
+            import_source=r["import_source"] if "import_source" in set(r.keys()) else None,
+        )
+
+    def create_snapshot(
+        self,
+        name: str,
+        batch_id: str | None = None,
+        scheme_name: str | None = None,
+        state: str | None = None,
+        severity: str | None = None,
+        project_type_id: str | None = None,
+        description: str | None = None,
+        overwrite: bool = False,
+    ) -> tuple[SnapshotInfo, list[SnapshotFileRecord], str]:
+        name = name.strip()
+        if not name:
+            raise ValueError("快照名称不能为空")
+
+        if not batch_id and not scheme_name:
+            raise SnapshotError("创建快照必须指定源批次 (-b/--batch) 或源筛选方案 (--scheme)")
+
+        if scheme_name:
+            scheme = self.get_scheme(scheme_name)
+            if scheme.batch_id:
+                batch_id = scheme.batch_id
+            state = scheme.state if scheme.state is not None else state
+            severity = scheme.severity if scheme.severity is not None else severity
+            project_type_id = scheme.project_type_id if scheme.project_type_id is not None else project_type_id
+
+        if not batch_id:
+            raise SnapshotError("无法确定源批次，方案未绑定批次且未通过 -b/--batch 指定")
+
+        batch = self.get_batch(batch_id)
+        if batch is None:
+            raise BatchNotFoundError(batch_id)
+
+        issues = self.get_issues(
+            batch_id,
+            state=state,
+            severity=severity,
+            project_type_id=project_type_id,
+        )
+
+        if not issues:
+            raise SnapshotEmptyError(name)
+
+        audit_log_by_issue: dict[int, list[dict[str, Any]]] = {}
+        full_audit = self.get_audit_log(batch_id)
+        for al in full_audit:
+            iid = al.get("issue_id")
+            if iid is not None:
+                if iid not in audit_log_by_issue:
+                    audit_log_by_issue[iid] = []
+                audit_log_by_issue[iid].append(al)
+
+        now = datetime.now().isoformat(timespec="seconds")
+        result_action = "create"
+
+        with self._tx() as conn:
+            existing = conn.execute(
+                "SELECT name FROM snapshots WHERE name = ?", (name,)
+            ).fetchone()
+
+            if existing and not overwrite:
+                raise SnapshotExistsError(name)
+
+            if existing:
+                old_rows = conn.execute(
+                    "SELECT * FROM snapshots WHERE name = ?", (name,)
+                ).fetchone()
+                old_files = conn.execute(
+                    "SELECT * FROM snapshot_files WHERE snapshot_name = ?", (name,)
+                ).fetchall()
+                old_data = json.dumps({
+                    "snapshot": dict(old_rows) if old_rows else None,
+                    "files": [dict(f) for f in old_files],
+                }, ensure_ascii=False)
+                conn.execute(
+                    """INSERT INTO snapshot_undo_log
+                    (snapshot_name, action, old_data, created_at)
+                    VALUES (?, ?, ?, ?)""",
+                    (name, "overwrite", old_data, now),
+                )
+                conn.execute("DELETE FROM snapshot_files WHERE snapshot_name = ?", (name,))
+                conn.execute("DELETE FROM snapshots WHERE name = ?", (name,))
+                result_action = "overwrite"
+
+            conn.execute(
+                """INSERT INTO snapshots
+                (name, source_batch_id, source_scheme_name, description,
+                 created_at, updated_at, import_source)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    name,
+                    batch_id,
+                    scheme_name,
+                    description,
+                    now,
+                    now,
+                    None,
+                ),
+            )
+
+            file_records: list[SnapshotFileRecord] = []
+            for issue in issues:
+                issue_audit = audit_log_by_issue.get(issue.id, [])
+                audit_json = json.dumps(issue_audit, ensure_ascii=False) if issue_audit else None
+
+                conn.execute(
+                    """INSERT INTO snapshot_files
+                    (snapshot_name, project_path, project_name, project_type_id,
+                     issue_type, severity, rule_name, file_path, message,
+                     fingerprint, state, handler, note, updated_at,
+                     batch_id, audit_log_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        name,
+                        issue.project_path,
+                        issue.project_name,
+                        issue.project_type_id,
+                        issue.issue_type,
+                        issue.severity,
+                        issue.rule_name,
+                        issue.file_path,
+                        issue.message,
+                        issue.fingerprint,
+                        issue.state,
+                        issue.handler,
+                        issue.note,
+                        issue.updated_at,
+                        batch_id,
+                        audit_json,
+                    ),
+                )
+                new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                file_records.append(SnapshotFileRecord(
+                    id=new_id,
+                    snapshot_name=name,
+                    project_path=issue.project_path,
+                    project_name=issue.project_name,
+                    project_type_id=issue.project_type_id,
+                    issue_type=issue.issue_type,
+                    severity=issue.severity,
+                    rule_name=issue.rule_name,
+                    file_path=issue.file_path,
+                    message=issue.message,
+                    fingerprint=issue.fingerprint,
+                    state=issue.state,
+                    handler=issue.handler,
+                    note=issue.note,
+                    updated_at=issue.updated_at,
+                    batch_id=batch_id,
+                    audit_log_json=audit_json,
+                ))
+
+            detail_parts = [f"batch={batch_id}", f"files={len(file_records)}"]
+            if scheme_name:
+                detail_parts.append(f"scheme={scheme_name}")
+            if state:
+                detail_parts.append(f"state={state}")
+            if severity:
+                detail_parts.append(f"severity={severity}")
+            if project_type_id:
+                detail_parts.append(f"project_type={project_type_id}")
+            if description:
+                detail_parts.append(f"desc={description[:50]}")
+            self._log_snapshot_audit(
+                conn, name, "create" if result_action == "create" else "overwrite",
+                detail=";".join(detail_parts),
+            )
+
+            pending = sum(1 for f in file_records if f.state == "pending")
+            passed = sum(1 for f in file_records if f.state == "passed")
+            ignored = sum(1 for f in file_records if f.state == "ignored")
+
+            snapshot_info = SnapshotInfo(
+                name=name,
+                source_batch_id=batch_id,
+                source_scheme_name=scheme_name,
+                file_count=len(file_records),
+                pending_count=pending,
+                passed_count=passed,
+                ignored_count=ignored,
+                description=description,
+                created_at=now,
+                updated_at=now,
+                import_source=None,
+            )
+
+            return snapshot_info, file_records, result_action
+
+    def list_snapshots(self) -> list[SnapshotInfo]:
+        sql = """SELECT s.name, s.source_batch_id, s.source_scheme_name, s.description,
+                 s.created_at, s.updated_at, s.import_source,
+                 COUNT(sf.id) as file_count,
+                 SUM(CASE WHEN sf.state='pending' THEN 1 ELSE 0 END) as pending_count,
+                 SUM(CASE WHEN sf.state='passed' THEN 1 ELSE 0 END) as passed_count,
+                 SUM(CASE WHEN sf.state='ignored' THEN 1 ELSE 0 END) as ignored_count
+                 FROM snapshots s LEFT JOIN snapshot_files sf ON s.name = sf.snapshot_name
+                 GROUP BY s.name
+                 ORDER BY s.updated_at DESC, s.name ASC"""
+        with self._conn() as conn:
+            rows = conn.execute(sql).fetchall()
+            return [self._build_snapshot_info(r) for r in rows]
+
+    def get_snapshot(self, name: str) -> SnapshotInfo:
+        sql = """SELECT s.name, s.source_batch_id, s.source_scheme_name, s.description,
+                 s.created_at, s.updated_at, s.import_source,
+                 COUNT(sf.id) as file_count,
+                 SUM(CASE WHEN sf.state='pending' THEN 1 ELSE 0 END) as pending_count,
+                 SUM(CASE WHEN sf.state='passed' THEN 1 ELSE 0 END) as passed_count,
+                 SUM(CASE WHEN sf.state='ignored' THEN 1 ELSE 0 END) as ignored_count
+                 FROM snapshots s LEFT JOIN snapshot_files sf ON s.name = sf.snapshot_name
+                 WHERE s.name = ?
+                 GROUP BY s.name"""
+        with self._conn() as conn:
+            row = conn.execute(sql, (name,)).fetchone()
+            if row is None or row["name"] is None:
+                raise SnapshotNotFoundError(name)
+            return self._build_snapshot_info(row)
+
+    def get_snapshot_files(self, name: str) -> list[SnapshotFileRecord]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM snapshot_files WHERE snapshot_name = ? ORDER BY project_name, id",
+                (name,),
+            ).fetchall()
+            if not rows:
+                snap = conn.execute(
+                    "SELECT name FROM snapshots WHERE name = ?", (name,)
+                ).fetchone()
+                if snap is None:
+                    raise SnapshotNotFoundError(name)
+            return [self._row_to_snapshot_file(r) for r in rows]
+
+    def delete_snapshot(self, name: str) -> None:
+        with self._tx() as conn:
+            existing = conn.execute(
+                "SELECT name FROM snapshots WHERE name = ?", (name,)
+            ).fetchone()
+            if existing is None:
+                raise SnapshotNotFoundError(name)
+
+            old_rows = conn.execute(
+                "SELECT * FROM snapshots WHERE name = ?", (name,)
+            ).fetchone()
+            old_files = conn.execute(
+                "SELECT * FROM snapshot_files WHERE snapshot_name = ?", (name,)
+            ).fetchall()
+            old_data = json.dumps({
+                "snapshot": dict(old_rows) if old_rows else None,
+                "files": [dict(f) for f in old_files],
+            }, ensure_ascii=False)
+            now = datetime.now().isoformat(timespec="seconds")
+            conn.execute(
+                """INSERT INTO snapshot_undo_log
+                (snapshot_name, action, old_data, created_at)
+                VALUES (?, ?, ?, ?)""",
+                (name, "delete", old_data, now),
+            )
+
+            self._log_snapshot_audit(
+                conn, name, "delete",
+                detail=f"删除快照 {name} 及其 {len(old_files)} 条文件记录",
+            )
+
+            conn.execute("DELETE FROM snapshot_files WHERE snapshot_name = ?", (name,))
+            conn.execute("DELETE FROM snapshots WHERE name = ?", (name,))
+
+    def _make_snapshot_package(
+        self,
+        snapshot: SnapshotInfo,
+        files: list[SnapshotFileRecord],
+    ) -> dict[str, Any]:
+        return {
+            "package_version": 1,
+            "package_type": "evidence_snapshot",
+            "tool_version": PACKAGE_VERSION,
+            "exported_at": datetime.now().isoformat(timespec="seconds"),
+            "snapshot": {
+                "name": snapshot.name,
+                "source_batch_id": snapshot.source_batch_id,
+                "source_scheme_name": snapshot.source_scheme_name,
+                "description": snapshot.description,
+                "file_count": snapshot.file_count,
+                "pending_count": snapshot.pending_count,
+                "passed_count": snapshot.passed_count,
+                "ignored_count": snapshot.ignored_count,
+                "created_at": snapshot.created_at,
+                "updated_at": snapshot.updated_at,
+            },
+            "files": [f.to_migration_dict() for f in files],
+        }
+
+    def export_snapshot_package(self, name: str) -> dict[str, Any]:
+        snapshot = self.get_snapshot(name)
+        files = self.get_snapshot_files(name)
+        return self._make_snapshot_package(snapshot, files)
+
+    def export_snapshot_package_to_file(
+        self,
+        name: str,
+        output_path: str | os.PathLike,
+    ) -> Path:
+        import zipfile
+        pkg = self.export_snapshot_package(name)
+        out = Path(output_path)
+        try:
+            out.parent.mkdir(parents=True, exist_ok=True)
+
+            if out.suffix.lower() == ".zip":
+                json_name = out.stem + ".json"
+                with zipfile.ZipFile(
+                    str(out), "w",
+                    compression=zipfile.ZIP_DEFLATED,
+                    compresslevel=9,
+                ) as zf:
+                    zf.writestr(
+                        json_name,
+                        json.dumps(pkg, ensure_ascii=False, indent=2),
+                    )
+            else:
+                if not out.suffix:
+                    out = out.with_suffix(".json")
+                out.write_text(
+                    json.dumps(pkg, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+        except (OSError, PermissionError, FileNotFoundError, zipfile.BadZipFile) as e:
+            raise SnapshotPackageError(f"写入快照包失败: {e}") from e
+        return out
+
+    @staticmethod
+    def _load_snapshot_package(file_path: str | os.PathLike) -> dict[str, Any]:
+        import zipfile
+        fp = Path(file_path)
+        abs_path = str(fp.resolve())
+
+        if not fp.exists():
+            raise SnapshotPackageError(f"快照包文件不存在: {abs_path}")
+
+        if fp.suffix.lower() == ".zip":
+            try:
+                with zipfile.ZipFile(str(fp), "r") as zf:
+                    names = zf.namelist()
+                    json_names = [n for n in names if n.lower().endswith(".json")]
+                    if not json_names:
+                        raise SnapshotPackageParseError(abs_path, "ZIP 压缩包内未找到 JSON 文件")
+                    json_name = json_names[0]
+                    with zf.open(json_name) as jf:
+                        raw = jf.read().decode("utf-8")
+            except FileNotFoundError as e:
+                raise SnapshotPackageError(f"快照包文件不存在: {abs_path}") from e
+            except zipfile.BadZipFile as e:
+                raise SnapshotPackageParseError(abs_path, f"无效的 ZIP 文件: {e}") from e
+        else:
+            try:
+                raw = fp.read_text(encoding="utf-8")
+            except FileNotFoundError as e:
+                raise SnapshotPackageError(f"快照包文件不存在: {abs_path}") from e
+
+        if not raw.strip():
+            raise SnapshotPackageEmptyError(abs_path)
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise SnapshotPackageParseError(abs_path, f"JSON 格式错误: {e.msg} (行{e.lineno}, 列{e.colno})") from e
+
+        if not isinstance(data, dict):
+            raise SnapshotPackageParseError(abs_path, f"顶层结构应为 JSON 对象，实际是 {type(data).__name__}")
+        if "package_type" not in data:
+            raise SnapshotPackageMissingFieldError(abs_path, "package_type")
+        if data["package_type"] != "evidence_snapshot":
+            raise SnapshotPackageParseError(abs_path, f"package_type 应为 'evidence_snapshot'，实际是 '{data['package_type']}'")
+
+        if "package_version" not in data:
+            raise SnapshotPackageMissingFieldError(abs_path, "package_version")
+        try:
+            version = int(data["package_version"])
+        except (TypeError, ValueError):
+            raise SnapshotPackageParseError(abs_path, f"package_version 必须是正整数，实际是 {data['package_version']!r}")
+        if version < 1 or version > 100:
+            raise SnapshotPackageError(f"无效的快照包 {abs_path}: 不支持的版本号 {version}")
+
+        for fld in ("snapshot", "files"):
+            if fld not in data:
+                raise SnapshotPackageMissingFieldError(abs_path, fld)
+
+        snap_data = data["snapshot"]
+        for fld in ("name", "created_at", "updated_at"):
+            if fld not in snap_data:
+                raise SnapshotPackageMissingFieldError(abs_path, fld, "snapshot")
+
+        files_data = data["files"]
+        if not isinstance(files_data, list):
+            raise SnapshotPackageParseError(abs_path, "'files' 字段应为数组")
+        if not files_data:
+            raise SnapshotPackageEmptyError(abs_path)
+
+        file_required = {"project_path", "project_name", "issue_type", "severity", "message", "state"}
+        for idx, f in enumerate(files_data):
+            if not isinstance(f, dict):
+                raise SnapshotPackageParseError(abs_path, f"第{idx + 1}条文件记录不是 JSON 对象")
+            for fld in file_required:
+                if fld not in f:
+                    raise SnapshotPackageMissingFieldError(abs_path, fld, f"files[{idx}]")
+
+        return data
+
+    def import_snapshot_package(
+        self,
+        file_path: str | os.PathLike,
+        overwrite_snapshot: bool = False,
+        overwrite_file: bool = False,
+        overwrite_state: bool = False,
+        import_source_label: str | None = None,
+    ) -> dict[str, Any]:
+        fp = Path(file_path)
+        abs_path = str(fp.resolve())
+        source_label = import_source_label or f"import:{fp.name}"
+
+        pkg = self._load_snapshot_package(abs_path)
+        snap_data = pkg["snapshot"]
+        snapshot_name = snap_data["name"].strip()
+        if not snapshot_name:
+            raise InvalidSnapshotPackageError(f"文件 {abs_path} 的快照名称为空")
+
+        files_data = pkg["files"]
+
+        result: dict[str, Any] = {
+            "source_file": abs_path,
+            "package_version": pkg.get("package_version"),
+            "tool_version": pkg.get("tool_version"),
+            "exported_at": pkg.get("exported_at"),
+            "snapshot_name": snapshot_name,
+            "imported_snapshot_name": snapshot_name,
+            "total_files": len(files_data),
+            "imported_files": [],
+            "imported_file_count": 0,
+            "skipped_snapshot": False,
+            "skipped_files": [],
+            "conflict_summary": {},
+            "warnings": [],
+        }
+
+        conflict_name = 0
+        conflict_fingerprint = 0
+        conflict_older_state = 0
+        overwritten_snapshot_flag = False
+        overwritten_file_count = 0
+        overwritten_state_count = 0
+        stale_state_blocked_count = 0
+
+        with self._tx() as conn:
+            existing_snapshot = conn.execute(
+                "SELECT name FROM snapshots WHERE name = ?", (snapshot_name,)
+            ).fetchone()
+
+            if existing_snapshot and not overwrite_snapshot:
+                conflict_name = 1
+                self._log_snapshot_audit(
+                    conn, snapshot_name, "import_skip",
+                    detail="同名快照已存在，使用默认跳过策略",
+                    source_file=abs_path,
+                )
+                result["skipped_snapshot"] = True
+                result["conflict_summary"] = {
+                    "skipped_duplicate_name": True,
+                    "skipped_fingerprint": 0,
+                    "skipped_stale_state": 0,
+                    "overwritten_snapshot": False,
+                    "overwritten_file": 0,
+                    "overwritten_state": 0,
+                    "stale_state_blocked": 0,
+                    "fingerprint_skipped_total": 0,
+                    "snapshot_skipped_total": 1,
+                }
+                # 默认策略：同名快照冲突 → 抛异常带中文摘要（除非显式 --overwrite-snapshot）
+                summary_parts = []
+                if result["conflict_summary"]["skipped_duplicate_name"]:
+                    summary_parts.append("同名快照冲突=检测到，默认已跳过")
+                if result["conflict_summary"]["skipped_fingerprint"]:
+                    summary_parts.append(f"指纹重复冲突={result['conflict_summary']['skipped_fingerprint']}条，默认已跳过")
+                if result["conflict_summary"]["skipped_stale_state"]:
+                    summary_parts.append(f"状态更旧冲突={result['conflict_summary']['skipped_stale_state']}条，默认已跳过")
+                summary_str = "；".join(summary_parts) if summary_parts else "检测到未命名冲突"
+                raise SnapshotImportConflictError(
+                    name=snapshot_name,
+                    detail=f"导入检测到冲突: {summary_str}",
+                )
+
+            now = datetime.now().isoformat(timespec="seconds")
+            old_snapshot_data = None
+            old_files_data_list = []
+
+            if existing_snapshot and overwrite_snapshot:
+                overwritten_snapshot_flag = True
+                old_row = conn.execute(
+                    "SELECT * FROM snapshots WHERE name = ?", (snapshot_name,)
+                ).fetchone()
+                old_files = conn.execute(
+                    "SELECT * FROM snapshot_files WHERE snapshot_name = ?", (snapshot_name,)
+                ).fetchall()
+                old_snapshot_data = dict(old_row) if old_row else None
+                old_files_data_list = [dict(f) for f in old_files]
+                undo_data = json.dumps({
+                    "snapshot": old_snapshot_data,
+                    "files": old_files_data_list,
+                }, ensure_ascii=False)
+                conn.execute(
+                    """INSERT INTO snapshot_undo_log
+                    (snapshot_name, action, old_data, created_at)
+                    VALUES (?, ?, ?, ?)""",
+                    (snapshot_name, "import_overwrite_snapshot", undo_data, now),
+                )
+                conn.execute("DELETE FROM snapshot_files WHERE snapshot_name = ?", (snapshot_name,))
+                conn.execute("DELETE FROM snapshots WHERE name = ?", (snapshot_name,))
+
+            if not existing_snapshot:
+                self._log_snapshot_audit(
+                    conn, snapshot_name, "import_create",
+                    detail=f"导入新建快照，文件 {len(files_data)} 条",
+                    source_file=abs_path,
+                )
+            else:
+                self._log_snapshot_audit(
+                    conn, snapshot_name, "import_overwrite_snapshot",
+                    detail=f"覆盖导入快照，文件 {len(files_data)} 条，旧记录 {len(old_files_data_list)} 条",
+                    source_file=abs_path,
+                )
+
+            conn.execute(
+                """INSERT INTO snapshots
+                (name, source_batch_id, source_scheme_name, description,
+                 created_at, updated_at, import_source)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    snapshot_name,
+                    snap_data.get("source_batch_id"),
+                    snap_data.get("source_scheme_name"),
+                    snap_data.get("description"),
+                    snap_data.get("created_at") or now,
+                    now,
+                    source_label,
+                ),
+            )
+
+            existing_fingerprints: dict[str, dict[str, Any]] = {}
+            if not overwrite_file and not overwrite_snapshot:
+                fp_rows = conn.execute(
+                    "SELECT fingerprint, id, state, updated_at FROM snapshot_files WHERE snapshot_name = ? AND fingerprint IS NOT NULL",
+                    (snapshot_name,),
+                ).fetchall()
+                for fr in fp_rows:
+                    if fr["fingerprint"]:
+                        existing_fingerprints[fr["fingerprint"]] = {
+                            "id": fr["id"],
+                            "state": fr["state"],
+                            "updated_at": fr["updated_at"],
+                        }
+
+            skipped_undo_files: list[dict[str, Any]] = []
+            for f in files_data:
+                fingerprint = f.get("fingerprint")
+                state_val = f.get("state", "pending")
+                updated_at = f.get("updated_at")
+
+                should_skip = False
+                skip_reason = ""
+
+                if fingerprint and fingerprint in existing_fingerprints and not overwrite_file:
+                    conflict_fingerprint += 1
+                    existing = existing_fingerprints[fingerprint]
+
+                    local_order = STATE_ORDER.get(existing["state"], -1)
+                    import_order = STATE_ORDER.get(state_val, -1)
+
+                    if import_order < local_order:
+                        conflict_older_state += 1
+                        stale_state_blocked_count += 1
+                        skip_reason = f"指纹重复且导入状态({state_val})比本地状态({existing['state']})更旧"
+                    else:
+                        skip_reason = "文件指纹重复"
+
+                    should_skip = True
+
+                if should_skip:
+                    result["skipped_files"].append({
+                        "fingerprint": fingerprint,
+                        "project_name": f.get("project_name"),
+                        "rule_name": f.get("rule_name"),
+                        "state": state_val,
+                        "reason": skip_reason,
+                    })
+                    continue
+
+                if fingerprint and existing_fingerprints and overwrite_file and fingerprint in existing_fingerprints:
+                    overwritten_file_count += 1
+                    existing = existing_fingerprints[fingerprint]
+                    local_order = STATE_ORDER.get(existing["state"], -1)
+                    import_order = STATE_ORDER.get(state_val, -1)
+                    if import_order < local_order:
+                        if overwrite_state:
+                            overwritten_state_count += 1
+                        else:
+                            stale_state_blocked_count += 1
+                    old_existing = conn.execute(
+                        "SELECT * FROM snapshot_files WHERE id = ?",
+                        (existing_fingerprints[fingerprint]["id"],),
+                    ).fetchone()
+                    if old_existing:
+                        skipped_undo_files.append(dict(old_existing))
+                    conn.execute(
+                        "DELETE FROM snapshot_files WHERE id = ?",
+                        (existing_fingerprints[fingerprint]["id"],),
+                    )
+
+                if state_val not in VALID_STATES:
+                    state_val = "pending"
+
+                audit_log_val = f.get("audit_log")
+                audit_json_val = json.dumps(audit_log_val, ensure_ascii=False) if isinstance(audit_log_val, list) else None
+
+                conn.execute(
+                    """INSERT INTO snapshot_files
+                    (snapshot_name, project_path, project_name, project_type_id,
+                     issue_type, severity, rule_name, file_path, message,
+                     fingerprint, state, handler, note, updated_at,
+                     batch_id, audit_log_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        snapshot_name,
+                        f["project_path"],
+                        f["project_name"],
+                        f.get("project_type_id"),
+                        f["issue_type"],
+                        f["severity"],
+                        f.get("rule_name"),
+                        f.get("file_path"),
+                        f["message"],
+                        fingerprint,
+                        state_val,
+                        f.get("handler"),
+                        f.get("note"),
+                        updated_at or now,
+                        f.get("batch_id"),
+                        audit_json_val,
+                    ),
+                )
+                new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                result["imported_files"].append({
+                    "new_id": new_id,
+                    "project_name": f.get("project_name"),
+                    "rule_name": f.get("rule_name"),
+                    "state": state_val,
+                })
+
+            if not existing_snapshot and skipped_undo_files:
+                pass
+
+        result["imported_file_count"] = len(result["imported_files"])
+        result["conflict_summary"] = {
+            "skipped_duplicate_name": conflict_name > 0 and not overwrite_snapshot,
+            "skipped_fingerprint": conflict_fingerprint,
+            "skipped_stale_state": conflict_older_state,
+            "overwritten_snapshot": overwritten_snapshot_flag,
+            "overwritten_file": overwritten_file_count,
+            "overwritten_state": overwritten_state_count,
+            "stale_state_blocked": stale_state_blocked_count,
+            "fingerprint_skipped_total": conflict_fingerprint,
+            "snapshot_skipped_total": conflict_name,
+        }
+
+        return result
+
+    def get_snapshot_undo_count(self, snapshot_name: str | None = None) -> int:
+        with self._conn() as conn:
+            if snapshot_name:
+                row = conn.execute(
+                    "SELECT COUNT(*) as cnt FROM snapshot_undo_log WHERE snapshot_name = ?",
+                    (snapshot_name,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) as cnt FROM snapshot_undo_log"
+                ).fetchone()
+            return row["cnt"] or 0
+
+    def undo_last_snapshot_action(self, snapshot_name: str | None = None) -> SnapshotUndoRecord:
+        with self._tx() as conn:
+            if snapshot_name:
+                row = conn.execute(
+                    "SELECT * FROM snapshot_undo_log WHERE snapshot_name = ? ORDER BY id DESC LIMIT 1",
+                    (snapshot_name,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM snapshot_undo_log ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+
+            if row is None:
+                raise EmptySnapshotUndoError()
+
+            undo = SnapshotUndoRecord(
+                id=row["id"],
+                snapshot_name=row["snapshot_name"],
+                action=row["action"],
+                old_data=row["old_data"],
+                created_at=row["created_at"],
+            )
+
+            try:
+                old = json.loads(undo.old_data)
+            except (json.JSONDecodeError, TypeError):
+                old = {}
+
+            old_snap = old.get("snapshot")
+            old_files = old.get("files", [])
+
+            conn.execute("DELETE FROM snapshot_files WHERE snapshot_name = ?", (undo.snapshot_name,))
+            conn.execute("DELETE FROM snapshots WHERE name = ?", (undo.snapshot_name,))
+
+            if old_snap:
+                conn.execute(
+                    """INSERT INTO snapshots
+                    (name, source_batch_id, source_scheme_name, description,
+                     created_at, updated_at, import_source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        old_snap.get("name", undo.snapshot_name),
+                        old_snap.get("source_batch_id"),
+                        old_snap.get("source_scheme_name"),
+                        old_snap.get("description"),
+                        old_snap.get("created_at", undo.created_at),
+                        old_snap.get("updated_at", undo.created_at),
+                        old_snap.get("import_source"),
+                    ),
+                )
+
+            for of in old_files:
+                conn.execute(
+                    """INSERT OR REPLACE INTO snapshot_files
+                    (id, snapshot_name, project_path, project_name, project_type_id,
+                     issue_type, severity, rule_name, file_path, message,
+                     fingerprint, state, handler, note, updated_at,
+                     batch_id, audit_log_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        of.get("id"),
+                        undo.snapshot_name,
+                        of.get("project_path", ""),
+                        of.get("project_name", ""),
+                        of.get("project_type_id"),
+                        of.get("issue_type", ""),
+                        of.get("severity", ""),
+                        of.get("rule_name"),
+                        of.get("file_path"),
+                        of.get("message", ""),
+                        of.get("fingerprint"),
+                        of.get("state", "pending"),
+                        of.get("handler"),
+                        of.get("note"),
+                        of.get("updated_at"),
+                        of.get("batch_id"),
+                        of.get("audit_log_json"),
+                    ),
+                )
+
+            self._log_snapshot_audit(
+                conn, undo.snapshot_name, "undo",
+                detail=f"撤销操作: {undo.action}",
+            )
+
+            conn.execute("DELETE FROM snapshot_undo_log WHERE id = ?", (undo.id,))
+
+            return undo
+
+    def get_snapshot_audit_log(self, snapshot_name: str | None = None) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM snapshot_audit_log"
+        params: list[Any] = []
+        if snapshot_name:
+            sql += " WHERE snapshot_name = ?"
+            params.append(snapshot_name)
         sql += " ORDER BY created_at ASC, id ASC"
         with self._conn() as conn:
             rows = conn.execute(sql, params).fetchall()

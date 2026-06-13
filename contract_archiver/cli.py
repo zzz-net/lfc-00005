@@ -40,11 +40,26 @@ from .exceptions import (
     LedgerPackageParseError,
     LedgerPackageMissingFieldError,
     InvalidLedgerPackageError,
+    SnapshotError,
+    SnapshotNotFoundError,
+    SnapshotExistsError,
+    SnapshotEmptyError,
+    EmptySnapshotUndoError,
+    SnapshotPackageError,
+    SnapshotPackageEmptyError,
+    SnapshotPackageParseError,
+    SnapshotPackageMissingFieldError,
+    InvalidSnapshotPackageError,
+    SnapshotImportConflictError,
 )
 from .exporter import export_csv, export_html, export_diff_csv, export_diff_html
 from .rules import load_rules
 from .scanner import scan_directory
-from .storage import STATE_LABELS, Storage, FilterScheme, DIFF_TYPE_LABELS, LEDGER_PROGRESS_LABELS, LEDGER_PRIORITY_LABELS
+from .storage import (
+    STATE_LABELS, Storage, FilterScheme, DIFF_TYPE_LABELS,
+    LEDGER_PROGRESS_LABELS, LEDGER_PRIORITY_LABELS,
+    STATE_ORDER, SnapshotInfo, SnapshotFileRecord,
+)
 
 
 def _ensure_utf8_stdio() -> None:
@@ -986,6 +1001,273 @@ def cmd_ledger_log(args: argparse.Namespace, storage: Storage) -> int:
     return 0
 
 
+def cmd_snapshot_create(args: argparse.Namespace, storage: Storage) -> int:
+    snapshot_info, file_records, action = storage.create_snapshot(
+        name=args.name,
+        batch_id=getattr(args, "batch", None),
+        scheme_name=getattr(args, "scheme", None),
+        state=getattr(args, "state", None),
+        severity=getattr(args, "severity", None),
+        project_type_id=getattr(args, "project_type", None),
+        description=getattr(args, "description", None),
+        overwrite=getattr(args, "overwrite", False),
+    )
+    action_label = "覆盖更新" if action == "overwrite" else "创建"
+    print(f"[OK] 已{action_label}证据快照包「{snapshot_info.name}」")
+    print(f"  文件记录数: {snapshot_info.file_count} 条")
+    print(f"  待补: {snapshot_info.pending_count} | 通过: {snapshot_info.passed_count} | 忽略: {snapshot_info.ignored_count}")
+    if snapshot_info.source_batch_id:
+        print(f"  源批次: {snapshot_info.source_batch_id}")
+    if snapshot_info.source_scheme_name:
+        print(f"  源筛选方案: {snapshot_info.source_scheme_name}")
+    if snapshot_info.description:
+        print(f"  描述: {snapshot_info.description}")
+    print(f"  创建时间: {snapshot_info.created_at}")
+    return 0
+
+
+def cmd_snapshot_list(args: argparse.Namespace, storage: Storage) -> int:
+    if getattr(args, "name", None):
+        name = args.name
+        snapshot = storage.get_snapshot(name)
+        if snapshot is None:
+            raise SnapshotNotFoundError(name)
+        files = storage.get_snapshot_files(name)
+        print(f"证据快照包「{snapshot.name}」详情：")
+        print(f"  创建时间: {snapshot.created_at}")
+        print(f"  更新时间: {snapshot.updated_at}")
+        if snapshot.source_batch_id:
+            print(f"  源批次: {snapshot.source_batch_id}")
+        if snapshot.source_scheme_name:
+            print(f"  源筛选方案: {snapshot.source_scheme_name}")
+        if snapshot.import_source:
+            print(f"  导入来源: {snapshot.import_source}")
+        if snapshot.description:
+            print(f"  描述: {snapshot.description}")
+        print(f"  文件记录数: {snapshot.file_count} 条")
+        print(f"  待补: {snapshot.pending_count} | 通过: {snapshot.passed_count} | 忽略: {snapshot.ignored_count}")
+        if not files:
+            print("  (无文件记录)")
+            return 0
+        print(f"\n{'ID':>5} {'类型':<8} {'严重度':<4} {'状态':<4} {'项目':<20} {'规则/文件':<30} 描述")
+        for f in files:
+            target = f.rule_name or f.file_path or "-"
+            desc = f.message[:50] + ("..." if len(f.message) > 50 else "")
+            print(
+                f"{f.id:>5} {f.issue_label:<8} {f.severity_label:<4} "
+                f"{f.state_label:<4} {f.project_name[:20]:<20} {target[:30]:<30} {desc}"
+            )
+        if getattr(args, "with_history", False):
+            print(f"\n{'='*80}")
+            print("处理历史（含审计日志）：")
+            for f in files:
+                if f.audit_log:
+                    print(f"\n  #{f.id} [{f.project_name}] {f.rule_name or f.file_path}")
+                    for al in f.audit_log:
+                        old_s = STATE_LABELS.get(al.get("old_state", ""), al.get("old_state", ""))
+                        new_s = STATE_LABELS.get(al.get("new_state", ""), al.get("new_state", ""))
+                        print(f"    {al.get('timestamp', al.get('created_at', ''))} "
+                              f"{al.get('action', '')}: {old_s} -> {new_s}"
+                              + (f" (处理人: {al.get('new_handler')})" if al.get('new_handler') else "")
+                              + (f" [备注: {al.get('new_note')}]" if al.get('new_note') else ""))
+    else:
+        snapshots = storage.list_snapshots()
+        if not snapshots:
+            print("  (无证据快照包)")
+            return 0
+        print(f"{'快照名':<25} {'记录':>5} {'待补':>4} {'通过':>4} {'忽略':>4} {'源批次':<26} {'更新时间':<20} 描述")
+        for s in snapshots:
+            src_batch = (s.source_batch_id or "")[:26] if s.source_batch_id else ""
+            desc = (s.description or "")[:30] if s.description else ""
+            print(
+                f"{s.name:<25} {s.file_count:>5} {s.pending_count:>4} {s.passed_count:>4} "
+                f"{s.ignored_count:>4} {src_batch:<26} {s.updated_at:<20} {desc}"
+            )
+    return 0
+
+
+def cmd_snapshot_show(args: argparse.Namespace, storage: Storage) -> int:
+    snapshot = storage.get_snapshot(args.name)
+    if snapshot is None:
+        raise SnapshotNotFoundError(args.name)
+    files = storage.get_snapshot_files(args.name)
+
+    if args.format == "json":
+        import json
+        snap_dict = {
+            "name": snapshot.name,
+            "source_batch_id": snapshot.source_batch_id,
+            "source_scheme_name": snapshot.source_scheme_name,
+            "description": snapshot.description,
+            "import_source": snapshot.import_source,
+            "file_count": snapshot.file_count,
+            "pending_count": snapshot.pending_count,
+            "passed_count": snapshot.passed_count,
+            "ignored_count": snapshot.ignored_count,
+            "created_at": snapshot.created_at,
+            "updated_at": snapshot.updated_at,
+            "files": [],
+        }
+        for f in files:
+            snap_dict["files"].append({
+                "id": f.id,
+                "project_path": f.project_path,
+                "project_name": f.project_name,
+                "project_type_id": f.project_type_id,
+                "issue_type": f.issue_type,
+                "issue_label": f.issue_label,
+                "severity": f.severity,
+                "severity_label": f.severity_label,
+                "rule_name": f.rule_name,
+                "file_path": f.file_path,
+                "message": f.message,
+                "fingerprint": f.fingerprint,
+                "state": f.state,
+                "state_label": f.state_label,
+                "handler": f.handler,
+                "note": f.note,
+                "updated_at": f.updated_at,
+                "batch_id": f.batch_id,
+                "audit_log": f.audit_log if getattr(args, "with_history", False) else None,
+            })
+        print(json.dumps(snap_dict, ensure_ascii=False, indent=2))
+    else:
+        args.name = args.name
+        args.with_history = getattr(args, "with_history", False)
+        return cmd_snapshot_list(args, storage)
+    return 0
+
+
+def cmd_snapshot_delete(args: argparse.Namespace, storage: Storage) -> int:
+    storage.delete_snapshot(args.name)
+    print(f"[OK] 已删除证据快照包「{args.name}」")
+    remaining = storage.get_snapshot_undo_count(args.name)
+    if remaining:
+        print(f"  可撤销: {remaining} 条（使用 snapshot undo 恢复）")
+    return 0
+
+
+def cmd_snapshot_export(args: argparse.Namespace, storage: Storage) -> int:
+    out_path = Path(args.output)
+    path = storage.export_snapshot_package_to_file(args.name, out_path)
+    pkg = storage.export_snapshot_package(args.name)
+    print(f"[OK] 证据快照包已导出: {path}")
+    print(f"  快照名: {pkg['snapshot']['name']}")
+    print(f"  文件记录数: {len(pkg['files'])} 条")
+    print(f"  导出时间: {pkg['exported_at']}")
+    print(f"  快照包格式版本: v{pkg['package_version']}")
+    if pkg["snapshot"].get("source_batch_id"):
+        print(f"  源批次: {pkg['snapshot']['source_batch_id']}")
+    if pkg["snapshot"].get("source_scheme_name"):
+        print(f"  源筛选方案: {pkg['snapshot']['source_scheme_name']}")
+    if out_path.suffix.lower() == ".zip":
+        print("  格式: ZIP 压缩包（内含 JSON）")
+    else:
+        print("  格式: 纯 JSON")
+    return 0
+
+
+def _format_snapshot_import_result(result: dict) -> str:
+    lines = [f"[OK] 证据快照包 {result['source_file']} 处理完成"]
+    lines.append(f"  快照名: {result['snapshot_name']}")
+    lines.append(f"  总计文件记录: {result['total_files']} 条")
+    if result.get("skipped_snapshot"):
+        lines.append("  结果: 同名快照已存在，默认跳过（使用 --overwrite-snapshot 可覆盖）")
+    if result["imported_files"]:
+        lines.append(f"  导入记录: {len(result['imported_files'])} 条")
+    if result["skipped_files"]:
+        lines.append(f"  跳过记录: {len(result['skipped_files'])} 条")
+        for sf in result["skipped_files"][:5]:
+            lines.append(
+                f"    - {sf.get('project_name', '')}: {sf.get('reason', '冲突已跳过')}"
+                + (f" (状态: {sf.get('state')})" if sf.get("state") else "")
+            )
+        if len(result["skipped_files"]) > 5:
+            lines.append(f"    ... 还有 {len(result['skipped_files']) - 5} 条跳过记录")
+    lines.append("  冲突摘要:")
+    for k, v in result.get("conflict_summary", {}).items():
+        lines.append(f"    - {k}: {v}")
+    if result.get("warnings"):
+        lines.append("  警告:")
+        for w in result["warnings"]:
+            lines.append(f"    - {w}")
+    return "\n".join(lines)
+
+
+def cmd_snapshot_import(args: argparse.Namespace, storage: Storage) -> int:
+    try:
+        result = storage.import_snapshot_package(
+            file_path=args.input,
+            overwrite_snapshot=getattr(args, "overwrite_snapshot", False),
+            overwrite_file=getattr(args, "overwrite_file", False),
+            overwrite_state=getattr(args, "overwrite_state", False),
+            import_source_label=getattr(args, "source_label", None),
+        )
+    except SnapshotPackageError:
+        raise
+    except SnapshotError:
+        raise
+    except ContractArchiverError:
+        raise
+    except Exception as e:
+        print(f"[导入失败] {e}", file=sys.stderr)
+        return 3
+
+    print(_format_snapshot_import_result(result))
+
+    has_skips = bool(result.get("skipped_snapshot") or result.get("skipped_files"))
+    has_imports = bool(result.get("imported_files"))
+
+    if has_skips and not has_imports:
+        if not (getattr(args, "overwrite_snapshot", False)
+                or getattr(args, "overwrite_file", False)
+                or getattr(args, "overwrite_state", False)):
+            print(
+                "\n[提示] 因冲突默认全部跳过，如需覆盖请加：\n"
+                "  --overwrite-snapshot  覆盖同名快照（整体替换）\n"
+                "  --overwrite-file      覆盖文件指纹重复的记录\n"
+                "  --overwrite-state     强制覆盖即使导入状态更旧",
+                file=sys.stderr
+            )
+        return 1
+    return 0
+
+
+def cmd_snapshot_undo(args: argparse.Namespace, storage: Storage) -> int:
+    if getattr(args, "count", False):
+        cnt = storage.get_snapshot_undo_count(getattr(args, "name", None))
+        print(f"可撤销快照操作数: {cnt}")
+        return 0
+    try:
+        undo = storage.undo_last_snapshot_action(getattr(args, "name", None))
+    except EmptySnapshotUndoError:
+        print("[撤销失败] 没有可撤销的证据快照包操作", file=sys.stderr)
+        return 1
+    print(f"[OK] 已撤销快照「{undo.snapshot_name}」操作: {undo.action}")
+    print(f"  原操作时间: {undo.created_at}")
+    remaining = storage.get_snapshot_undo_count(undo.snapshot_name)
+    if remaining:
+        print(f"  剩余可撤销: {remaining} 条")
+    return 0
+
+
+def cmd_snapshot_audit(args: argparse.Namespace, storage: Storage) -> int:
+    logs = storage.get_snapshot_audit_log(getattr(args, "name", None))
+    if not logs:
+        print("  (无快照操作审计记录)")
+        return 0
+    print(f"{'时间':<20} {'操作':<25} {'快照名':<25} 来源/详情")
+    for lg in logs:
+        src = lg.get("source_file") or ""
+        detail = lg.get("detail") or ""
+        extra = src or detail
+        print(
+            f"{lg['created_at']:<20} {lg['action']:<25} "
+            f"{lg['snapshot_name']:<25} {extra}"
+        )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="contract-archiver",
@@ -1214,6 +1496,64 @@ def build_parser() -> argparse.ArgumentParser:
     pl_log = ledger_sub.add_parser("log", help="查看台账操作日志")
     pl_log.add_argument("name", nargs="?", default=None, help="台账名称")
     pl_log.set_defaults(func=cmd_ledger_log)
+
+    p_snapshot = sub.add_parser("snapshot", help="证据快照包管理（导出可交接的关键文件清单）")
+    snapshot_sub = p_snapshot.add_subparsers(dest="snapshot_action", required=True)
+
+    ps_create = snapshot_sub.add_parser("create", help="从批次或筛选方案创建快照包")
+    ps_create.add_argument("name", help="快照名称（唯一标识）")
+    ps_create.add_argument("-b", "--batch", help="源批次ID（与--scheme二选一，或二者结合）")
+    ps_create.add_argument("--scheme", help="使用筛选方案作为源（方案绑定的条件会被采用）")
+    ps_create.add_argument("--state", choices=["pending", "passed", "ignored"], help="按状态过滤问题")
+    ps_create.add_argument("--severity", choices=["error", "warning"], help="按严重度过滤问题")
+    ps_create.add_argument("--project-type", dest="project_type", help="按项目类型ID过滤问题")
+    ps_create.add_argument("--description", help="快照描述（便于识别交接内容）")
+    ps_create.add_argument("--overwrite", action="store_true", help="同名快照已存在则覆盖")
+    ps_create.set_defaults(func=cmd_snapshot_create)
+
+    ps_list = snapshot_sub.add_parser("list", help="列出所有快照或查看某个快照详情")
+    ps_list.add_argument("name", nargs="?", default=None, help="快照名称（省略则列出所有快照）")
+    ps_list.add_argument("--with-history", action="store_true", dest="with_history",
+                         help="查看详情时附带每条记录的处理历史审计日志")
+    ps_list.set_defaults(func=cmd_snapshot_list)
+
+    ps_show = snapshot_sub.add_parser("show", help="查看快照详情（支持 JSON 格式）")
+    ps_show.add_argument("name", help="快照名称")
+    ps_show.add_argument("--format", choices=["table", "json"], default="table",
+                         help="输出格式（默认 table，含文件清单表格）")
+    ps_show.add_argument("--with-history", action="store_true", dest="with_history",
+                         help="JSON 输出时附带每条记录的审计历史")
+    ps_show.set_defaults(func=cmd_snapshot_show)
+
+    ps_del = snapshot_sub.add_parser("delete", help="删除快照（可撤销恢复）")
+    ps_del.add_argument("name", help="快照名称")
+    ps_del.set_defaults(func=cmd_snapshot_delete)
+
+    ps_exp = snapshot_sub.add_parser("export", help="导出快照为 JSON 或 ZIP 压缩包")
+    ps_exp.add_argument("name", help="要导出的快照名称")
+    ps_exp.add_argument("-o", "--output", required=True,
+                        help="输出文件路径（.json 为纯 JSON，.zip 为压缩包，默认 .json）")
+    ps_exp.set_defaults(func=cmd_snapshot_export)
+
+    ps_imp = snapshot_sub.add_parser("import", help="从快照包文件导入（支持 .json 和 .zip）")
+    ps_imp.add_argument("input", help="快照包文件路径（.json 或 .zip）")
+    ps_imp.add_argument("--source-label", help="自定义导入来源标签（默认: import:<文件名>）")
+    ps_imp.add_argument("--overwrite-snapshot", action="store_true",
+                        help="同名快照已存在时，整体覆盖整个快照（危险操作，可撤销）")
+    ps_imp.add_argument("--overwrite-file", action="store_true",
+                        help="文件指纹重复时，覆盖该条文件记录")
+    ps_imp.add_argument("--overwrite-state", action="store_true",
+                        help="即使导入的状态比本地更旧，也允许覆盖（需配合--overwrite-file使用）")
+    ps_imp.set_defaults(func=cmd_snapshot_import)
+
+    ps_undo = snapshot_sub.add_parser("undo", help="撤销最近一次快照操作（创建/覆盖/删除/导入覆盖）")
+    ps_undo.add_argument("name", nargs="?", default=None, help="撤销指定快照名的最近变更（省略则撤销最近）")
+    ps_undo.add_argument("--count", action="store_true", help="仅显示可撤销操作数量")
+    ps_undo.set_defaults(func=cmd_snapshot_undo)
+
+    ps_audit = snapshot_sub.add_parser("audit", help="查看快照操作审计日志")
+    ps_audit.add_argument("name", nargs="?", default=None, help="仅查看指定快照名的日志（省略则查看全部）")
+    ps_audit.set_defaults(func=cmd_snapshot_audit)
 
     return parser
 

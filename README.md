@@ -250,6 +250,132 @@ python -m contract_archiver export -b <批次ID> -o report.html
 python -m contract_archiver export -b <批次ID> -o report.csv -f csv
 ```
 
+### 6. 证据快照包管理
+
+法务在扫描出问题并初步处理后，可以把某个批次或筛选方案内的**关键文件清单、问题状态、处理人、备注、处理历史**整体打成一个可交接的「证据快照包」，通过 U 盘或邮件交给同事在另一台机器继续核对。快照包数据 SQLite 持久化，工具重启后仍可查询；全链路写审计日志；覆盖后可撤销回退。
+
+**快照 vs 工作包的区别**：工作包是把整个批次（含所有问题和完整撤销历史）整体交接，侧重「把这批活交给谁接着干」；快照包侧重「把这批证据（文件清单 + 状态 + 备注 + 处理历史）打包封存，便于多人间串行或并行复核」，不需要包含撤销历史。
+
+```bash
+# ===== 创建快照 =====
+# 从整个批次创建快照（所有问题全收）
+python -m contract_archiver snapshot create 法务-待复核-采购类 \
+  -b <批次ID> --description "2024年Q4采购合同待复核清单"
+
+# 结合筛选条件创建快照（只打包待补的错误级问题）
+python -m contract_archiver snapshot create 法务-重点核查 \
+  -b <批次ID> --state pending --severity error
+
+# 从已保存的筛选方案创建快照（方案的批次/状态/严重度/项目类型会被自动使用）
+python -m contract_archiver snapshot create 复核-采购待补 \
+  --scheme 法务-待补错误
+
+# 覆盖同名快照（不加 --overwrite 重名会报错）
+python -m contract_archiver snapshot create 法务-重点核查 \
+  -b <批次ID> --overwrite --description "更新后的核查清单"
+
+# ===== 查看快照 =====
+# 列出所有快照（按更新时间倒序）
+python -m contract_archiver snapshot list
+
+# 查看某个快照详情（含每条文件记录的清单）
+python -m contract_archiver snapshot list 法务-重点核查
+
+# 查看详情 + 每条记录的处理历史（变更了谁、从什么状态改到什么、备注是什么）
+python -m contract_archiver snapshot list 法务-重点核查 --with-history
+
+# JSON 格式输出详情（便于程序化处理）
+python -m contract_archiver snapshot show 法务-重点核查 --format json
+
+# JSON 输出含审计历史
+python -m contract_archiver snapshot show 法务-重点核查 --format json --with-history
+
+# ===== 导出快照（给另一台机器用） =====
+# 导出为纯 JSON（便于查看和 diff）
+python -m contract_archiver snapshot export 法务-重点核查 -o 法务复核包_2024Q4.json
+
+# 导出为 ZIP 压缩包（体积小，便于邮件/IM 传输）
+python -m contract_archiver snapshot export 法务-重点核查 -o 法务复核包_2024Q4.zip
+
+# ===== 导入快照（在另一台机器） =====
+# 默认策略：遇到同名快照/指纹重复/状态更旧 → 全部跳过，并输出中文摘要
+python -m contract_archiver snapshot import 法务复核包_2024Q4.json
+
+# 导入 ZIP 格式同样支持
+python -m contract_archiver snapshot import 法务复核包_2024Q4.zip
+
+# 显式覆盖同名快照（整体替换整个快照内容，可撤销）
+python -m contract_archiver snapshot import 法务复核包_2024Q4.json --overwrite-snapshot
+
+# 仅在文件指纹重复时覆盖单条记录（保留不冲突的条目）
+python -m contract_archiver snapshot import 法务复核包_2024Q4.json --overwrite-file
+
+# 即使导入的状态比本地更旧也强制覆盖（通常配合 --overwrite-file 使用）
+python -m contract_archiver snapshot import 法务复核包_2024Q4.json --overwrite-file --overwrite-state
+
+# ===== 撤销 =====
+# 查看可撤销数量
+python -m contract_archiver snapshot undo --count
+
+# 撤销最近一次操作（覆盖创建/删除/覆盖导入都可撤销）
+python -m contract_archiver snapshot undo
+
+# 撤销指定快照的最近一次操作
+python -m contract_archiver snapshot undo 法务-重点核查
+
+# ===== 审计日志 =====
+# 查看所有快照的操作记录（创建/覆盖/删除/导入/跳过/撤销 全可追溯）
+python -m contract_archiver snapshot audit
+
+# 仅查看某个快照的审计记录
+python -m contract_archiver snapshot audit 法务-重点核查
+```
+
+**快照导入冲突处理规则**（默认为「跳过 + 中文摘要」，不加显式参数绝不覆盖）：
+
+| 冲突类型 | 默认行为 | 显式覆盖参数 |
+|---------|---------|-------------|
+| 同名快照已存在 | 整个快照整体跳过，提示「同名快照已存在」 | `--overwrite-snapshot` |
+| 文件指纹重复（同一条问题已在本地存在） | 单条记录跳过，提示「指纹重复」 | `--overwrite-file` |
+| 导入状态比本地更旧（例如本地已通过，导入包里还是待补） | 单条记录跳过，提示「状态更旧」 | `--overwrite-state`（需配合 `--overwrite-file`） |
+
+**完整链路示例：扫描 → 标记 → 打快照 → 导出 → 另一台机器导入继续核对 → 覆盖 → 撤销回退**
+
+```bash
+# === 机器A ===
+# 1. 扫描，拿到批次ID
+python -m contract_archiver scan -c examples/rules.yaml -d examples/sample_data
+# → 批次ID: BATCH_XXXX
+
+# 2. 标记几条问题的状态（模拟法务核对）
+python -m contract_archiver mark -b BATCH_XXXX --to passed --ids 1 2 \
+  --handler "张律师" --note "已核对原件"
+
+# 3. 打一个快照包，包含所有问题的状态和处理历史
+python -m contract_archiver snapshot create Q4复核快照 \
+  -b BATCH_XXXX --description "2024Q4采购合同初步核对结果"
+
+# 4. 导出为 ZIP 发给同事
+python -m contract_archiver snapshot export Q4复核快照 -o Q4复核.zip
+
+# === 机器B（同事的电脑） ===
+# 5. 导入快照（同数据库里已有同名 → 默认跳过，提示冲突摘要）
+python -m contract_archiver snapshot import Q4复核.zip
+# → 输出：冲突摘要: 同名快照冲突=检测到，默认已跳过...
+
+# 6. 确认要覆盖就加 --overwrite-snapshot
+python -m contract_archiver snapshot import Q4复核.zip --overwrite-snapshot
+
+# 7. 查看详情，继续核对
+python -m contract_archiver snapshot list Q4复核快照 --with-history
+
+# 8. 覆盖后想回退（可撤销）
+python -m contract_archiver snapshot undo Q4复核快照
+
+# 9. 查看审计日志确认所有操作
+python -m contract_archiver snapshot audit
+```
+
 ## 错误反馈场景
 
 | 场景 | 提示示例 |
@@ -298,6 +424,16 @@ python -m contract_archiver workpack log --help
 python -m contract_archiver mark --help
 python -m contract_archiver undo --help
 python -m contract_archiver export --help
+python -m contract_archiver ledger --help
+python -m contract_archiver ledger create --help
+python -m contract_archiver ledger list --help
+python -m contract_archiver ledger update --help
+python -m contract_archiver ledger config --help
+python -m contract_archiver ledger export --help
+python -m contract_archiver ledger export-pkg --help
+python -m contract_archiver ledger import --help
+python -m contract_archiver ledger undo --help
+python -m contract_archiver ledger log --help
 ```
 
 ## 项目结构

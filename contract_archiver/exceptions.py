@@ -258,3 +258,69 @@ class LedgerPackageMissingFieldError(LedgerPackageError):
 class InvalidLedgerPackageError(LedgerPackageError):
     def __init__(self, reason: str):
         super().__init__(f"[台账包无效] {reason}")
+
+
+class SnapshotError(ContractArchiverError):
+    """证据快照包通用错误基类"""
+    pass
+
+
+class SnapshotNotFoundError(SnapshotError):
+    def __init__(self, name: str):
+        super().__init__(f"[快照不存在] 未找到证据快照包: {name}")
+
+
+class SnapshotExistsError(SnapshotError):
+    def __init__(self, name: str):
+        super().__init__(
+            f"[快照已存在] 证据快照包 '{name}' 已存在，使用 --overwrite 可覆盖"
+        )
+
+
+class SnapshotEmptyError(SnapshotError):
+    def __init__(self, name: str):
+        super().__init__(
+            f"[快照为空] 证据快照包 '{name}' 未包含任何问题记录，至少需要一条"
+        )
+
+
+class EmptySnapshotUndoError(SnapshotError):
+    def __init__(self):
+        super().__init__("[撤销失败] 没有可撤销的证据快照包操作")
+
+
+class SnapshotPackageError(SnapshotError):
+    """证据快照包导入导出通用错误基类"""
+    pass
+
+
+class SnapshotPackageEmptyError(SnapshotPackageError):
+    def __init__(self, file_path: str):
+        super().__init__(f"[快照包为空] 证据快照包文件 {file_path} 为空，没有可导入的内容")
+
+
+class SnapshotPackageParseError(SnapshotPackageError):
+    def __init__(self, file_path: str, detail: str):
+        super().__init__(f"[快照包解析失败] 无法解析文件 {file_path}: {detail}")
+
+
+class SnapshotPackageMissingFieldError(SnapshotPackageError):
+    def __init__(self, file_path: str, field: str, section: str | None = None):
+        pos = f"（{section}）" if section else ""
+        super().__init__(
+            f"[快照包缺字段] 文件 {file_path}{pos} 缺少必填字段: {field}"
+        )
+
+
+class InvalidSnapshotPackageError(SnapshotPackageError):
+    def __init__(self, reason: str):
+        super().__init__(f"[快照包无效] {reason}")
+
+
+class SnapshotImportConflictError(SnapshotPackageError):
+    def __init__(self, name: str, detail: str):
+        super().__init__(
+            f"[快照导入冲突] 快照 '{name}' {detail}，"
+            f"使用 --overwrite-snapshot 可覆盖同名快照，使用 --overwrite-file 可覆盖指纹重复记录，"
+            f"使用 --overwrite-state 可覆盖更旧的状态"
+        )
